@@ -26,11 +26,15 @@ uv venv
 uv pip install -e .
 ```
 
-Smoke-test against your local Redis:
+## Tests
 
 ```bash
-.venv/bin/python test_smoke.py
+uv pip install -e ".[dev]"   # pytest + fakeredis
+pytest
 ```
+
+Unit tests run against an in-memory fake Redis (no server needed); one integration test
+runs against a real Redis when `REDIS_URL` is reachable and is skipped otherwise.
 
 ## Tools
 
