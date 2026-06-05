@@ -1,4 +1,4 @@
-"""agent-mail MCP Server.
+"""agent-bulletin MCP Server.
 
 A tiny Redis-backed per-project news feed for AI agents. Agents POST short messages
 to a project, and CHECK a project's mailbox to catch up on what's new since they last
@@ -12,9 +12,9 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from agent_mail.store import DEFAULT_TTL_DAYS, RedisStore
+from agent_bulletin.store import DEFAULT_TTL_DAYS, RedisStore
 
-mcp = FastMCP("agent-mail")
+mcp = FastMCP("agent-bulletin")
 
 _store: Optional[RedisStore] = None
 

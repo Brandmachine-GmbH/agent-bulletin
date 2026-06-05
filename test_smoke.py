@@ -1,4 +1,4 @@
-"""Smoke test for agent-mail's RedisStore against a live Redis.
+"""Smoke test for agent-bulletin's RedisStore against a live Redis.
 
 Runs end-to-end (post / check_mailbox / search / get_thread / read / list_projects),
 asserting expected behaviour, then cleans up its own keys. Uses a throwaway project so
@@ -9,7 +9,7 @@ Run:  .venv/bin/python test_smoke.py
 
 import sys
 
-from agent_mail.store import RedisStore
+from agent_bulletin.store import RedisStore
 
 PROJECT = "_smoketest"
 

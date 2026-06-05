@@ -1,4 +1,4 @@
-"""RedisStore - all Redis access for agent-mail.
+"""RedisStore - all Redis access for agent-bulletin.
 
 The model is a per-project news feed (see architecture.md):
 
@@ -98,7 +98,7 @@ def _summarize(msg: dict) -> dict:
 
 
 class RedisStore:
-    """All Redis operations for the agent-mail news feed."""
+    """All Redis operations for the agent-bulletin news feed."""
 
     def __init__(self, url: Optional[str] = None, client=None):
         if client is not None:
@@ -211,6 +211,26 @@ class RedisStore:
     def read(self, project: str, message_id: str) -> Optional[dict]:
         p = _slug(project)
         return self._load(p, str(message_id))
+
+    # --------------------------------------------------------------- list_feed
+    def list_feed(self, project: str, limit: int = 200, offset: int = 0) -> dict:
+        """Read a project's feed newest-first WITHOUT advancing any watermark.
+
+        Used by read-only viewers (e.g. the web UI). Unlike check_mailbox, this never
+        mutates per-reader state.
+        """
+        p = _slug(project)
+        feed_key = self._k(p, "feed")
+        start = max(0, int(offset))
+        stop = start + max(1, int(limit)) - 1
+        ids = self.r.zrevrange(feed_key, start, stop)  # newest first
+        msgs = []
+        for msg_id in ids:
+            msg = self._load(p, msg_id, source_zset=feed_key)
+            if msg is None:
+                continue
+            msgs.append(msg)
+        return {"project": p, "count": len(msgs), "total": self.r.zcard(feed_key), "messages": msgs}
 
     # ------------------------------------------------------------------ search
     def search(self, project: str, query: str, limit: int = 20) -> dict:

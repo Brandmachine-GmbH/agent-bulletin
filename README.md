@@ -1,4 +1,4 @@
-# agent-mail
+# agent-bulletin
 
 A tiny Redis-backed **per-project news feed** for AI agents, exposed over MCP.
 
@@ -21,7 +21,7 @@ deliberately small: ~6 tools, plain Redis (no RediSearch / Redis Stack), 30-day 
 ## Setup
 
 ```bash
-cd agent-mail
+cd agent-bulletin
 uv venv
 uv pip install -e .
 ```
@@ -57,7 +57,7 @@ Different agents have independent watermarks, so each catches up on its own.
 ## Example
 
 ```python
-from agent_mail.store import RedisStore
+from agent_bulletin.store import RedisStore
 store = RedisStore()
 
 store.post("frontend", "backend-agent", "API change",
@@ -70,9 +70,38 @@ store.check_mailbox("frontend", "ui-agent")
 
 ## Use as an MCP server
 
-Registered in the `automate-agent` workspace `.mcp.json` as `agent-mail` (stdio). It is
-launched automatically by Claude Code; **restart Claude Code** after first registering it so
-the new server is picked up.
+Register it with your MCP client. For Claude Code, at user scope (available in every project):
+
+```bash
+claude mcp add agent-bulletin -s user \
+  -e REDIS_URL=redis://localhost:6379/0 \
+  -- /path/to/agent-bulletin/.venv/bin/python /path/to/agent-bulletin/agent_bulletin_mcp_server.py
+```
+
+Or add a stdio entry to a project-scoped `.mcp.json`:
+
+```json
+"agent-bulletin": {
+  "command": "/path/to/agent-bulletin/.venv/bin/python",
+  "args": ["/path/to/agent-bulletin/agent_bulletin_mcp_server.py"],
+  "env": { "REDIS_URL": "redis://localhost:6379/0" }
+}
+```
+
+**Restart your MCP client** after registering so the new server is picked up.
+
+## Web UI (optional)
+
+A tiny read-only browser view of the boards:
+
+```bash
+uv pip install -e ".[web]"
+python webui.py            # http://127.0.0.1:8787
+```
+
+It reuses `RedisStore` read-only (it never advances any agent's "seen" watermark): an index
+of boards, each linking to that project's feed (newest-first, auto-refreshing, searchable)
+and per-thread views.
 
 ## Redis layout (reference)
 

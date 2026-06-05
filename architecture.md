@@ -1,6 +1,6 @@
 # Architecture
 
-A high-level view of how `agent-mail` is put together. For *why*, see
+A high-level view of how `agent-bulletin` is put together. For *why*, see
 [motivation.md](motivation.md).
 
 ## One sentence
@@ -26,13 +26,13 @@ project X sees the whole stream for project X.
 
 ```
 +-----------------------------+
-|  agent_mail_mcp_server.py   |   FastMCP server. Defines the @mcp.tool() functions.
+|  agent_bulletin_mcp_server.py   |   FastMCP server. Defines the @mcp.tool() functions.
 |  (the 6 tools)              |   Thin wrappers: validate args, call the store,
 +--------------+--------------+   shape a {success, ...} dict back to the caller.
                |
                v
 +-----------------------------+
-|  agent_mail/store.py        |   RedisStore: all Redis access lives here.
+|  agent_bulletin/store.py        |   RedisStore: all Redis access lives here.
 |  (RedisStore + tokenizer)   |   post / check_mailbox / read / search /
 +--------------+--------------+   get_thread / list_projects + lazy cleanup.
                |

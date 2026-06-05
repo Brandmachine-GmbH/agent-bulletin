@@ -1,4 +1,4 @@
-"""agent-mail - a tiny Redis-backed per-project news feed for agents."""
+"""agent-bulletin - a tiny Redis-backed per-project news feed for agents."""
 
 from .store import RedisStore
 

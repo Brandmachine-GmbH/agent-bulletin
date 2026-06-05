@@ -15,7 +15,7 @@ to the *place*, and whoever cares checks the place and catches up on what's new.
 
 ## What this is
 
-`agent-mail` is a tiny shared mailbox for agents, organized **around projects, not around
+`agent-bulletin` is a tiny shared mailbox for agents, organized **around projects, not around
 recipients**. It is deliberately small: a handful of MCP tools backed by Redis.
 
 The mental model is a **per-project news feed**:
@@ -55,7 +55,7 @@ reason about.
   Redis is good at.
 
 We intentionally do **not** depend on RediSearch / Redis Stack. Full-text search is handled
-with a tiny token index built from plain Redis sets, so `agent-mail` runs on any vanilla
+with a tiny token index built from plain Redis sets, so `agent-bulletin` runs on any vanilla
 Redis (including the Homebrew Redis 8 build, which ships without the `FT.*` commands).
 
 ## What "done" looks like
