@@ -126,3 +126,38 @@ def test_slug_normalization():
 def test_tokenizer_drops_short_tokens():
     assert _tokenize("Hi the Deploy/Orders v2") == {"hi", "the", "deploy", "orders", "v2"}
     assert "a" not in _tokenize("a big cat")  # single chars dropped
+
+
+# --- regression tests for the 2026-06-06 audit fixes -------------------------
+
+def test_burst_no_drops_and_in_order(store):
+    # ids reach two digits (1..13). With id-based feed scoring, id 9 must precede id 10,
+    # and draining in small pages must deliver every message exactly once, in order.
+    for i in range(13):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    seen = []
+    while True:
+        page = store.check_mailbox("p", "r", limit=3)
+        if page["count"] == 0:
+            break
+        seen += [m["subject"] for m in page["messages"]]
+    assert seen == [f"s{i}" for i in range(13)]  # all 13, in post order: no drops, no scramble
+
+
+def test_empty_check_then_immediate_post_is_delivered(store):
+    assert store.check_mailbox("p", "r")["count"] == 0  # empty mailbox leaves watermark untouched
+    store.post("p", "a", "s", "b")
+    assert store.check_mailbox("p", "r")["count"] == 1  # the post is not lost to a wall-clock race
+
+
+def test_limit_zero_returns_nothing_and_does_not_advance(store):
+    store.post("p", "a", "s", "b")
+    assert store.check_mailbox("p", "r", limit=0)["count"] == 0
+    assert store.check_mailbox("p", "r")["count"] == 1  # limit=0 didn't consume the message
+
+
+def test_unicode_search(store):
+    store.post("p", "a", "Bericht", "Müller war im Café")
+    assert store.search("p", "müller")["count"] == 1  # accented, case-insensitive
+    assert store.search("p", "café")["count"] == 1
+    assert store.search("p", "MÜLLER")["count"] == 1  # casefold

@@ -14,17 +14,26 @@ import json
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Optional, Union
 
 import redis
 
 DEFAULT_TTL_DAYS = 30
+MAX_TTL_DAYS = 3650   # 10 years: upper bound so ttl_days can't be set to something absurd
+MAX_LIMIT = 500       # upper bound on messages returned by a single call
 PROJECTS_KEY = "am:projects"
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Unicode-aware: \w matches letters/digits/underscore across scripts (accents, CJK, ...).
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
 _SNIPPET_LEN = 160
+
+
+def _clamp_limit(limit: int) -> int:
+    """Coerce a caller-supplied limit into [1, MAX_LIMIT]."""
+    return min(max(1, int(limit)), MAX_LIMIT)
 
 
 def _slug(project: Optional[str]) -> str:
@@ -35,8 +44,11 @@ def _slug(project: Optional[str]) -> str:
 
 
 def _tokenize(text: str) -> set:
-    """Lowercase, split on non-alphanumerics, drop tokens shorter than 2 chars."""
-    return {t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) >= 2}
+    """Tokenize for search: NFKC-normalize, casefold, split on non-word characters, drop
+    tokens shorter than 2 chars. Unicode-aware, so accented and non-Latin text (e.g.
+    "Mueller"/"Müller", "café", CJK) tokenizes sensibly instead of being shredded to ASCII."""
+    text = unicodedata.normalize("NFKC", text or "")
+    return {t for t in _TOKEN_RE.findall(text.casefold()) if len(t) >= 2}
 
 
 def _normalize_agents(value: Union[None, str, list]) -> list:
@@ -155,16 +167,21 @@ class RedisStore:
             "created_at": repr(created_at),
         }
         msg_key = self._k(p, "msg", msg_id)
-        ttl = int(max(1, ttl_days) * 86400)
+        ttl = min(max(1, int(ttl_days)), MAX_TTL_DAYS) * 86400
+        # Score the feed/thread by the unique monotonic id, NOT the timestamp. Ids never
+        # tie, so chronological ordering and the per-reader watermark stay exact even for
+        # same-instant bursts (timestamp scores collide and Redis then orders ties by
+        # lexicographic member, which scrambles order and silently drops messages).
+        score = int(msg_id)
 
         pipe = self.r.pipeline()
         pipe.hset(msg_key, mapping=msg)
         pipe.expire(msg_key, ttl)
-        pipe.zadd(self._k(p, "feed"), {msg_id: created_at})
-        pipe.zadd(self._k(p, "thread", thread_id), {msg_id: created_at})
+        pipe.zadd(self._k(p, "feed"), {msg_id: score})
+        pipe.zadd(self._k(p, "thread", thread_id), {msg_id: score})
         for token in _tokenize(f"{subject} {body}"):
             pipe.sadd(self._k(p, "idx", token), msg_id)
-        pipe.zadd(PROJECTS_KEY, {p: created_at})
+        pipe.zadd(PROJECTS_KEY, {p: created_at})  # activity time, display/sort only
         pipe.execute()
 
         return {"message_id": msg_id, "thread_id": thread_id, "project": p}
@@ -177,32 +194,37 @@ class RedisStore:
         feed_key = self._k(p, "feed")
         seen_key = self._k(p, "seen", agent)
 
+        # limit < 1 means "show nothing": return without touching the watermark, so a
+        # caller can never consume/lose messages by asking for zero.
+        if int(limit) < 1:
+            return {"project": p, "agent": agent, "count": 0, "messages": []}
+        lim = _clamp_limit(limit)
+
+        # The watermark is the last message id this agent has seen. Ids are unique and
+        # monotonic, so "newer than" is exact - no timestamp ties, no silent skips.
         raw = self.r.get(seen_key)
         try:
-            watermark = float(raw) if raw is not None else 0.0
+            watermark = int(raw) if raw is not None else 0
         except (ValueError, TypeError):
-            watermark = 0.0
+            watermark = 0  # tolerate a legacy/garbage value by re-reading from the start
 
-        # ids strictly newer than the watermark, oldest first, capped at limit
-        ids = self.r.zrangebyscore(
-            feed_key, f"({watermark}", "+inf", start=0, num=max(1, int(limit))
-        )
+        # ids strictly newer than the watermark, oldest (lowest id) first, capped at lim
+        ids = self.r.zrangebyscore(feed_key, f"({watermark}", "+inf", start=0, num=lim)
 
         messages = []
-        last_ts = watermark
+        last_id = watermark
         for msg_id in ids:
+            last_id = max(last_id, int(msg_id))  # advance past every id we scanned
             msg = self._load(p, msg_id, source_zset=feed_key)
             if msg is None:
                 continue
             messages.append(_summarize(msg))
-            if msg["created_at"] > last_ts:
-                last_ts = msg["created_at"]
 
-        if mark_seen:
-            # advance only to the last message actually returned, so a backlog
-            # bigger than `limit` is drained over successive checks rather than skipped
-            new_watermark = last_ts if messages else self._now()
-            self.r.set(seen_key, repr(new_watermark))
+        if mark_seen and ids:
+            # advance to the last id scanned this page; a backlog bigger than `lim` is
+            # drained over successive checks rather than skipped. Nothing scanned -> the
+            # watermark is left untouched (no wall-clock fallback to race against posts).
+            self.r.set(seen_key, str(last_id))
             self.r.expire(seen_key, DEFAULT_TTL_DAYS * 86400)
 
         return {"project": p, "agent": agent, "count": len(messages), "messages": messages}
@@ -222,7 +244,7 @@ class RedisStore:
         p = _slug(project)
         feed_key = self._k(p, "feed")
         start = max(0, int(offset))
-        stop = start + max(1, int(limit)) - 1
+        stop = start + _clamp_limit(limit) - 1
         ids = self.r.zrevrange(feed_key, start, stop)  # newest first
         msgs = []
         for msg_id in ids:
@@ -250,7 +272,7 @@ class RedisStore:
             msgs.append(msg)
 
         msgs.sort(key=lambda m: m["created_at"], reverse=True)  # newest first
-        msgs = msgs[: max(1, int(limit))]
+        msgs = msgs[: _clamp_limit(limit)]
         return {"project": p, "count": len(msgs), "messages": [_summarize(m) for m in msgs]}
 
     # -------------------------------------------------------------- get_thread
@@ -266,12 +288,12 @@ class RedisStore:
                 continue
             msgs.append(msg)
 
-        msgs = msgs[: max(1, int(limit))]
+        msgs = msgs[: _clamp_limit(limit)]
         return {"project": p, "thread_id": str(thread_id), "count": len(msgs), "messages": msgs}
 
     # ----------------------------------------------------------- list_projects
     def list_projects(self, limit: int = 50) -> dict:
-        items = self.r.zrevrange(PROJECTS_KEY, 0, max(1, int(limit)) - 1, withscores=True)
+        items = self.r.zrevrange(PROJECTS_KEY, 0, _clamp_limit(limit) - 1, withscores=True)
         projects = []
         for slug, score in items:
             feed_size = self.r.zcard(self._k(slug, "feed"))
