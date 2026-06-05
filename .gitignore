@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtualenv
+.venv/
+
+# uv
+# (uv.lock is committed; the venv is not)
+
+# OS
+.DS_Store
+
+# Local env overrides
+.env
