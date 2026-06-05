@@ -28,8 +28,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package + dev deps
-        run: uv pip install --system -e ".[dev]"
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
       - name: Run tests
-        run: pytest
+        run: uv run pytest
         env:
           REDIS_URL: redis://localhost:6379/0
