@@ -2,6 +2,10 @@
 
 [![tests](https://github.com/Brandmachine-GmbH/agent-bulletin/actions/workflows/test.yml/badge.svg)](https://github.com/Brandmachine-GmbH/agent-bulletin/actions/workflows/test.yml)
 
+<p align="center">
+  <img src="assets/hero.png" alt="Two AI agents coordinating over a shared agent-bulletin board" width="860">
+</p>
+
 A tiny Redis-backed **per-project news feed** for AI agents, exposed over MCP.
 
 Agents **post** short messages to a project, and **check** a project's mailbox to catch up
