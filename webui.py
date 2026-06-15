@@ -23,30 +23,69 @@ store = RedisStore()
 
 ACCENT = "#ff5500"  # Brandmachine orange
 
+# Light-theme variable overrides, reused for the explicit toggle and the
+# no-JS system-preference fallback so the two stay in sync.
+_LIGHT_VARS = (
+    "--bg:#f7f7f8;--text:#1c1d21;--border:#e4e4e7;--muted:#6b7280;"
+    "--card-bg:#ffffff;--card-border:#e9e9ec;--card-border-left:#d6d6da;--card-body:#3f4651;"
+    "--input-bg:#ffffff;--input-border:#d0d0d4;--empty:#9aa0a8;"
+    "--badge-normal:#7b818c;--badge-low:#aeb3bb;"
+)
+
 STYLE = f"""
+:root {{
+  --accent: {ACCENT};
+  --bg: #0f1115; --text: #e6e6e6; --border: #222; --muted: #888;
+  --card-bg: #171a21; --card-border: #222; --card-border-left: #333; --card-body: #cfcfcf;
+  --input-bg: #171a21; --input-border: #333; --empty: #777;
+  --badge-normal: #5a5f6a; --badge-low: #3a3f48;
+}}
+[data-theme="light"] {{ {_LIGHT_VARS} }}
+@media (prefers-color-scheme: light) {{ :root:not([data-theme]) {{ {_LIGHT_VARS} }} }}
 * {{ box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        margin: 0; background: #0f1115; color: #e6e6e6; }}
-a {{ color: {ACCENT}; text-decoration: none; }}
+        margin: 0; background: var(--bg); color: var(--text);
+        transition: background-color .15s ease, color .15s ease; }}
+a {{ color: var(--accent); text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
-header {{ padding: 16px 24px; border-bottom: 1px solid #222; display: flex; align-items: baseline; gap: 12px; }}
+header {{ padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }}
 header h1 {{ font-size: 18px; margin: 0; }}
-.muted {{ color: #888; font-size: 13px; }}
+.muted {{ color: var(--muted); font-size: 13px; }}
 .wrap {{ max-width: 860px; margin: 0 auto; padding: 24px; }}
-.card {{ background: #171a21; border: 1px solid #222; border-left: 3px solid #333;
-         border-radius: 8px; padding: 14px 16px; margin: 0 0 12px; }}
-.card.high {{ border-left-color: {ACCENT}; }}
+.card {{ background: var(--card-bg); border: 1px solid var(--card-border); border-left: 3px solid var(--card-border-left);
+         border-radius: 8px; padding: 14px 16px; margin: 0 0 12px;
+         transition: background-color .15s ease, border-color .15s ease; }}
+.card.high {{ border-left-color: var(--accent); }}
 .card .subject {{ font-size: 15px; font-weight: 600; margin: 0 0 4px; }}
-.card .meta {{ color: #888; font-size: 12px; margin-bottom: 8px; }}
-.card .body {{ white-space: pre-wrap; font-size: 14px; line-height: 1.5; color: #cfcfcf; }}
+.card .meta {{ color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
+.card .body {{ white-space: pre-wrap; font-size: 14px; line-height: 1.5; color: var(--card-body); }}
 .badge {{ display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px;
           color: #fff; vertical-align: middle; }}
 .proj {{ display: flex; justify-content: space-between; align-items: center; }}
 .search {{ margin: 0 0 18px; }}
-.search input {{ background: #171a21; border: 1px solid #333; color: #e6e6e6;
+.search input {{ background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text);
                  padding: 8px 12px; border-radius: 6px; width: 280px; font-size: 14px; }}
-.empty {{ color: #777; padding: 48px 0; text-align: center; }}
+.empty {{ color: var(--empty); padding: 48px 0; text-align: center; }}
+.theme-toggle {{ margin-left: auto; background: transparent; border: 1px solid var(--border);
+  color: var(--text); border-radius: 6px; padding: 4px 9px; font-size: 14px; cursor: pointer; line-height: 1; }}
+.theme-toggle:hover {{ border-color: var(--accent); }}
 """
+
+# Set the saved theme before first paint to avoid a flash of the wrong theme.
+_HEAD_SCRIPT = (
+    "<script>(function(){try{var t=localStorage.getItem('theme');"
+    "if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
+)
+# Toggle handler + icon sync; runs on every (auto-refreshing) page load.
+_BODY_SCRIPT = (
+    "<script>function _bmTheme(){return document.documentElement.getAttribute('data-theme')||"
+    "(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');}"
+    "function _bmIcon(){var b=document.getElementById('theme-toggle');"
+    "if(b)b.textContent=_bmTheme()==='light'?'\\u2600\\ufe0f':'\\u263d';}"
+    "function toggleTheme(){var n=_bmTheme()==='light'?'dark':'light';"
+    "document.documentElement.setAttribute('data-theme',n);"
+    "try{localStorage.setItem('theme',n);}catch(e){}_bmIcon();}_bmIcon();</script>"
+)
 
 
 def _page(title: str, body: str, *, refresh: Optional[int] = None) -> str:
@@ -54,10 +93,13 @@ def _page(title: str, body: str, *, refresh: Optional[int] = None) -> str:
     return (
         f'<!doctype html><html><head><meta charset="utf-8">'
         f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f'<title>{html.escape(title)}</title>{meta}<style>{STYLE}</style></head><body>'
+        f'<title>{html.escape(title)}</title>{meta}{_HEAD_SCRIPT}<style>{STYLE}</style></head><body>'
         f'<header><h1><a href="/">agent-bulletin</a></h1>'
-        f'<span class="muted">{html.escape(title)}</span></header>'
-        f'<div class="wrap">{body}</div></body></html>'
+        f'<span class="muted">{html.escape(title)}</span>'
+        f'<button id="theme-toggle" class="theme-toggle" type="button" '
+        f'onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Toggle theme"></button>'
+        f'</header>'
+        f'<div class="wrap">{body}</div>{_BODY_SCRIPT}</body></html>'
     )
 
 
@@ -69,8 +111,8 @@ def _fmt(ts: float) -> str:
 
 
 def _badge(importance: str) -> str:
-    colors = {"high": ACCENT, "normal": "#5a5f6a", "low": "#3a3f48"}
-    c = colors.get(importance, "#5a5f6a")
+    colors = {"high": "var(--accent)", "normal": "var(--badge-normal)", "low": "var(--badge-low)"}
+    c = colors.get(importance, "var(--badge-normal)")
     return f'<span class="badge" style="background:{c}">{html.escape(importance or "normal")}</span>'
 
 
