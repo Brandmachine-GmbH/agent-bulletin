@@ -8,11 +8,11 @@ whole stream for X. `from`/`to` are metadata, not routing.
 See motivation.md and architecture.md for the design.
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 from fastmcp import FastMCP
 
-from agent_bulletin.store import DEFAULT_TTL_DAYS, RedisStore
+from agent_bulletin.store import DEFAULT_BOOTSTRAP, DEFAULT_TTL_DAYS, RedisStore
 
 mcp = FastMCP("agent-bulletin")
 
@@ -89,6 +89,8 @@ def check_mailbox(
     agent: str,
     limit: int = 20,
     mark_seen: bool = True,
+    bootstrap: Union[int, str] = DEFAULT_BOOTSTRAP,
+    since_hours: Optional[float] = None,
 ) -> dict:
     """Check a project's mailbox: get the messages this agent has not seen yet.
 
@@ -97,6 +99,10 @@ def check_mailbox(
     after returns nothing new. If there is a backlog larger than `limit`, repeated calls
     drain it page by page.
 
+    A reader that has never checked this project before (a new agent, or an existing one
+    under a new name) starts at the recent end rather than replaying the archive: it gets
+    only the newest few messages, and `skipped` says how much history it stepped over.
+
     Args:
         project: The project / channel to check.
         agent: The reader's name. Each agent has its own independent "seen" position per
@@ -104,14 +110,59 @@ def check_mailbox(
         limit: Max messages to return this call (default 20).
         mark_seen: If True (default), advance this agent's seen-marker to the last message
                    returned. Set False to peek without marking anything seen.
+        bootstrap: How many recent messages this agent gets on its FIRST check of the
+                   project (default 3). 0 means "start caught up": deliver nothing this
+                   first time. Pass "all" to replay the project from the start instead.
+                   Ignored once the agent has a seen-marker here.
+        since_hours: Only return messages newer than this many hours (e.g. 24 for "today").
+                     Anything older is treated as already seen, so it will not come back on
+                     the next check either.
 
     Returns:
-        {"success": bool, "count": int, "messages": [summary...], "error": str}
+        {"success": bool, "count": int, "skipped": int, "messages": [summary...],
+         "error": str}
+        `skipped` counts the older feed entries that bootstrap / since_hours jumped over.
+        Expired ones are counted too, so read it as roughly how much history was passed
+        over, not as an exact message count.
         Each summary has: id, thread_id, from, to, subject, importance, created_at,
         created_at_iso, snippet. Use read_message for the full body.
     """
     try:
-        result = get_store().check_mailbox(project, agent, limit=limit, mark_seen=mark_seen)
+        result = get_store().check_mailbox(
+            project, agent, limit=limit, mark_seen=mark_seen,
+            bootstrap=bootstrap, since_hours=since_hours,
+        )
+        return {"success": True, **result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def latest_messages(
+    project: str,
+    limit: int = 5,
+    since_hours: Optional[float] = None,
+) -> dict:
+    """Show the most recent messages in a project, newest first.
+
+    Read-only: this never advances any agent's seen-marker, so it costs nothing and can be
+    repeated. Use it to get oriented in a fresh context ("what is going on in this
+    project?") without draining an unread backlog. Use check_mailbox instead when you want
+    to catch up as a named agent and not see the same messages twice.
+
+    Args:
+        project: The project / channel to look at.
+        limit: Max messages to return (default 5).
+        since_hours: Only return messages newer than this many hours (e.g. 24 for "today").
+
+    Returns:
+        {"success": bool, "count": int, "total": int, "messages": [summary...],
+         "error": str}
+        `total` is how many messages the project has in all. Use read_message for a full
+        body.
+    """
+    try:
+        result = get_store().latest(project, limit=limit, since_hours=since_hours)
         return {"success": True, **result}
     except Exception as e:
         return {"success": False, "error": str(e)}

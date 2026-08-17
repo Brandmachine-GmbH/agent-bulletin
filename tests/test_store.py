@@ -1,5 +1,7 @@
 """Unit tests for RedisStore, backed by fakeredis (no real Redis required)."""
 
+import time
+
 from agent_bulletin.store import _slug, _tokenize
 
 
@@ -123,6 +125,13 @@ def test_slug_normalization():
     assert _slug(None) == "default"
 
 
+def test_underscore_and_dash_are_one_project(store):
+    # "layer_align" and "layer-align" must not become two separate feeds
+    assert _slug("layer_align") == _slug("layer-align") == "layer-align"
+    store.post("layer_align", "a", "one", "b1")
+    assert store.check_mailbox("layer-align", "r")["count"] == 1
+
+
 def test_tokenizer_drops_short_tokens():
     assert _tokenize("Hi the Deploy/Orders v2") == {"hi", "the", "deploy", "orders", "v2"}
     assert "a" not in _tokenize("a big cat")  # single chars dropped
@@ -137,7 +146,7 @@ def test_burst_no_drops_and_in_order(store):
         store.post("p", "a", f"s{i}", f"body {i}")
     seen = []
     while True:
-        page = store.check_mailbox("p", "r", limit=3)
+        page = store.check_mailbox("p", "r", limit=3, bootstrap="all")
         if page["count"] == 0:
             break
         seen += [m["subject"] for m in page["messages"]]
@@ -161,3 +170,147 @@ def test_unicode_search(store):
     assert store.search("p", "müller")["count"] == 1  # accented, case-insensitive
     assert store.search("p", "café")["count"] == 1
     assert store.search("p", "MÜLLER")["count"] == 1  # casefold
+
+
+# --- recency: fresh readers, time-scoped catch-up, latest -------------------
+
+def _age(store, project, msg_id, hours):
+    """Backdate one message by `hours` (created_at is what since_hours reads)."""
+    store.r.hset(store._k(project, "msg", str(msg_id)), "created_at",
+                 repr(time.time() - hours * 3600))
+
+
+def test_fresh_reader_gets_only_recent_messages(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    res = store.check_mailbox("p", "newcomer")
+    assert [m["subject"] for m in res["messages"]] == ["s7", "s8", "s9"]  # newest 3 only
+    assert res["skipped"] == 7
+    assert store.check_mailbox("p", "newcomer")["count"] == 0  # and it is now caught up
+
+
+def test_renamed_agent_does_not_replay_the_archive(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    store.check_mailbox("p", "agent-v1")
+    store.post("p", "a", "fresh", "new one")
+    res = store.check_mailbox("p", "agent-v2")  # same reader, different name string
+    assert res["count"] == 3  # not 11
+    assert res["messages"][-1]["subject"] == "fresh"
+
+
+def test_bootstrap_all_replays_everything(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    res = store.check_mailbox("p", "r", bootstrap="all")
+    assert res["count"] == 10
+    assert res["skipped"] == 0
+
+
+def test_bootstrap_size_is_configurable(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    assert store.check_mailbox("p", "r", bootstrap=2)["count"] == 2
+
+
+def test_bootstrap_zero_starts_caught_up(store):
+    # 0 must mean "no history", not "all history": it is the input a caller reaches for
+    # when it wants to start clean, and the archive is the one thing it must never get
+    for i in range(50):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    assert store.check_mailbox("p", "r", bootstrap=0)["count"] == 0
+    store.post("p", "a", "after", "b")
+    res = store.check_mailbox("p", "r")  # but it is caught up, not deaf
+    assert [m["subject"] for m in res["messages"]] == ["after"]
+
+
+def test_bootstrap_none_falls_back_to_the_default(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    assert store.check_mailbox("p", "r", bootstrap=None)["count"] == 3
+    assert store.check_mailbox("p", "r2", bootstrap="nonsense")["count"] == 3
+
+
+def test_bootstrap_only_applies_to_the_first_check(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    store.check_mailbox("p", "r", bootstrap=1)
+    for i in range(5):
+        store.post("p", "a", f"n{i}", f"body {i}")
+    res = store.check_mailbox("p", "r", bootstrap=1)  # bootstrap no longer applies
+    assert res["count"] == 5
+    assert res["skipped"] == 0
+
+
+def test_bootstrap_peek_does_not_strand_the_backlog(store):
+    for i in range(10):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    assert store.check_mailbox("p", "r", mark_seen=False)["count"] == 3
+    assert store.check_mailbox("p", "r", bootstrap="all")["count"] == 10  # peek consumed nothing
+
+
+def test_since_hours_skips_older_messages(store):
+    store.post("p", "a", "yesterday", "b")
+    store.post("p", "a", "this-morning", "b")
+    _age(store, "p", 1, 50)
+    _age(store, "p", 2, 2)
+    res = store.check_mailbox("p", "r", since_hours=24, bootstrap="all")
+    assert [m["subject"] for m in res["messages"]] == ["this-morning"]
+    assert res["skipped"] == 1
+
+
+def test_since_hours_with_a_stale_watermark(store):
+    # the trap: a reader far behind on a big backlog asking "anything today?" must get
+    # today's message, not a page of old ones (and not "nothing new")
+    for i in range(30):
+        store.post("p", "a", f"old{i}", "b")
+        _age(store, "p", i + 1, 100)
+    store.check_mailbox("p", "r", limit=1, bootstrap="all")  # watermark parked at the start
+    store.post("p", "a", "today", "b")
+    res = store.check_mailbox("p", "r", since_hours=24, limit=20)
+    assert [m["subject"] for m in res["messages"]] == ["today"]
+    assert res["skipped"] == 29
+
+
+def test_since_hours_survives_an_expired_message_mid_feed(store):
+    # ttl_days is per message, so a short-lived message can expire while OLDER neighbours
+    # are still alive. The cutoff search must skip the dangling entry, not treat it as a
+    # boundary: getting this wrong floors the watermark past live unread messages, and the
+    # floor is persisted, so they are lost for good.
+    for name, hours in [("older-live", 40), ("expired", 30), ("newer-live", 28)]:
+        r = store.post("p", "a", name, "b")
+        _age(store, "p", r["message_id"], hours)
+    store.r.delete(store._k("p", "msg", "2"))  # the short-TTL one expires first
+
+    res = store.check_mailbox("p", "r", since_hours=48, bootstrap="all")
+    assert [m["subject"] for m in res["messages"]] == ["older-live", "newer-live"]
+    assert res["skipped"] == 0
+
+
+def test_since_hours_with_nothing_recent_stays_empty(store):
+    store.post("p", "a", "old", "b")
+    _age(store, "p", 1, 100)
+    assert store.check_mailbox("p", "r", since_hours=24)["count"] == 0
+    # skipped stays skipped: it must not reappear on the next, unfiltered check
+    assert store.check_mailbox("p", "r")["count"] == 0
+
+
+def test_latest_is_newest_first_and_read_only(store):
+    for i in range(5):
+        store.post("p", "a", f"s{i}", f"body {i}")
+    res = store.latest("p", limit=2)
+    assert [m["subject"] for m in res["messages"]] == ["s4", "s3"]  # newest first
+    assert res["total"] == 5
+    assert store.check_mailbox("p", "r", bootstrap="all")["count"] == 5  # consumed nothing
+
+
+def test_latest_since_hours(store):
+    store.post("p", "a", "old", "b")
+    store.post("p", "a", "new", "b")
+    _age(store, "p", 1, 100)
+    assert [m["subject"] for m in store.latest("p", since_hours=24)["messages"]] == ["new"]
+
+
+def test_latest_on_empty_project(store):
+    res = store.latest("nothing-here")
+    assert res["count"] == 0 and res["total"] == 0 and res["messages"] == []

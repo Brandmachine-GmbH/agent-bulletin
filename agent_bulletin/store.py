@@ -23,11 +23,14 @@ import redis
 DEFAULT_TTL_DAYS = 30
 MAX_TTL_DAYS = 3650   # 10 years: upper bound so ttl_days can't be set to something absurd
 MAX_LIMIT = 500       # upper bound on messages returned by a single call
+DEFAULT_BOOTSTRAP = 3  # messages a first-time reader gets instead of the whole archive
 PROJECTS_KEY = "am:projects"
 
 # Unicode-aware: \w matches letters/digits/underscore across scripts (accents, CJK, ...).
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-_SLUG_RE = re.compile(r"[^a-z0-9_-]+")
+# Everything that is not a letter or digit collapses to "-", so "my_project", "my project"
+# and "my-project" are one feed rather than three.
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SNIPPET_LEN = 160
 
 
@@ -49,6 +52,31 @@ def _tokenize(text: str) -> set:
     "Mueller"/"Müller", "café", CJK) tokenizes sensibly instead of being shredded to ASCII."""
     text = unicodedata.normalize("NFKC", text or "")
     return {t for t in _TOKEN_RE.findall(text.casefold()) if len(t) >= 2}
+
+
+def _bootstrap_keep(value: Union[None, int, str]) -> Optional[int]:
+    """How many recent messages a first-time reader should be given.
+
+    None means "no floor at all", i.e. replay the project from the very beginning; only
+    the explicit string "all" asks for that. 0 means the opposite, "start caught up": the
+    first check delivers nothing. Anything unparseable, None included (read as "not
+    specified"), falls back to the default rather than dumping an archive on a reader that
+    never asked for one.
+    """
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("all", "everything"):
+            return None
+        if s in ("", "recent", "default"):
+            return DEFAULT_BOOTSTRAP
+        value = s
+    if value is None:
+        return DEFAULT_BOOTSTRAP
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_BOOTSTRAP
+    return max(0, n)
 
 
 def _normalize_agents(value: Union[None, str, list]) -> list:
@@ -130,6 +158,52 @@ class RedisStore:
     def ping(self) -> bool:
         return self.r.ping()
 
+    # ------------------------------------------------------- watermark floors
+    def _created_at(self, p: str, msg_id: str) -> Optional[float]:
+        """Timestamp of one message, or None if its hash has expired."""
+        raw = self.r.hget(self._k(p, "msg", msg_id), "created_at")
+        try:
+            return float(raw) if raw is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    def _bootstrap_floor(self, feed_key: str, keep: int) -> int:
+        """Exclusive lower bound that leaves only the newest `keep` messages unseen.
+
+        Used for a reader's very first look at a project: a fresh (or renamed) agent
+        should get a short orientation, not a 30-day archive replayed oldest-first.
+        `keep=0` floors at the newest message, so the reader simply starts caught up.
+        """
+        if keep <= 0:
+            newest = self.r.zrevrange(feed_key, 0, 0)
+            return int(newest[0]) if newest else 0
+        tail = self.r.zrevrange(feed_key, 0, _clamp_limit(keep) - 1)  # newest first
+        return int(tail[-1]) - 1 if tail else 0
+
+    def _since_floor(self, p: str, feed_key: str, since_hours: float) -> int:
+        """Exclusive lower bound that leaves only messages newer than `since_hours` unseen.
+
+        Walks the feed newest-first and stops at the first message older than the cutoff.
+        A binary search over ranks would be cheaper, but it is not safe here: `ttl_days` is
+        per message, so an expired hash can sit anywhere in the feed rather than only at
+        the old end, and a search that has to guess which side of the cutoff a dangling
+        entry falls on can floor the watermark past live, unread messages, which the
+        persisted floor then hides forever. Walking lets a dangling entry simply be
+        skipped: it can never be delivered, so it can never be the boundary. Feeds stay
+        small (the TTL keeps them in the hundreds) and the walk stops at the cutoff rather
+        than running the whole feed.
+
+        Returns 0 when everything is recent enough, or the newest id when nothing is.
+        """
+        cutoff = self._now() - max(0.0, float(since_hours)) * 3600.0
+        for msg_id in self.r.zrevrange(feed_key, 0, -1):  # newest first
+            ts = self._created_at(p, msg_id)
+            if ts is None:
+                continue
+            if ts < cutoff:
+                return int(msg_id)
+        return 0
+
     # ----------------------------------------------------------------- loading
     def _load(self, p: str, msg_id: str, *, source_zset: Optional[str] = None,
               source_sets: Optional[list] = None) -> Optional[dict]:
@@ -188,7 +262,8 @@ class RedisStore:
 
     # ----------------------------------------------------------- check_mailbox
     def check_mailbox(self, project: str, agent: str, limit: int = 20,
-                      mark_seen: bool = True) -> dict:
+                      mark_seen: bool = True, bootstrap: Union[int, str, None] = DEFAULT_BOOTSTRAP,
+                      since_hours: Optional[float] = None) -> dict:
         p = _slug(project)
         agent = (agent or "anonymous").strip() or "anonymous"
         feed_key = self._k(p, "feed")
@@ -197,16 +272,28 @@ class RedisStore:
         # limit < 1 means "show nothing": return without touching the watermark, so a
         # caller can never consume/lose messages by asking for zero.
         if int(limit) < 1:
-            return {"project": p, "agent": agent, "count": 0, "messages": []}
+            return {"project": p, "agent": agent, "count": 0, "skipped": 0, "messages": []}
         lim = _clamp_limit(limit)
 
         # The watermark is the last message id this agent has seen. Ids are unique and
         # monotonic, so "newer than" is exact - no timestamp ties, no silent skips.
         raw = self.r.get(seen_key)
+        first_visit = raw is None
         try:
             watermark = int(raw) if raw is not None else 0
         except (ValueError, TypeError):
             watermark = 0  # tolerate a legacy/garbage value by re-reading from the start
+
+        # Both options below only ever push the watermark FORWARD, so they can skip old
+        # messages but never re-deliver ones already seen.
+        stored = watermark
+        keep = _bootstrap_keep(bootstrap)
+        if first_visit and keep is not None:
+            watermark = max(watermark, self._bootstrap_floor(feed_key, keep))
+        if since_hours is not None:
+            watermark = max(watermark, self._since_floor(p, feed_key, since_hours))
+        skipped = (self.r.zcount(feed_key, f"({stored}", watermark)
+                   if watermark > stored else 0)
 
         # ids strictly newer than the watermark, oldest (lowest id) first, capped at lim
         ids = self.r.zrangebyscore(feed_key, f"({watermark}", "+inf", start=0, num=lim)
@@ -220,14 +307,19 @@ class RedisStore:
                 continue
             messages.append(_summarize(msg))
 
-        if mark_seen and ids:
+        if mark_seen and (ids or watermark > stored):
             # advance to the last id scanned this page; a backlog bigger than `lim` is
-            # drained over successive checks rather than skipped. Nothing scanned -> the
-            # watermark is left untouched (no wall-clock fallback to race against posts).
+            # drained over successive checks rather than skipped. Nothing scanned and no
+            # floor applied -> the watermark is left untouched (no wall-clock fallback to
+            # race against posts). A floor IS persisted even when it returned nothing, so
+            # "skipped" stays skipped instead of reappearing on the next check; a floor is
+            # always derived from an id already in the feed, and a concurrent post takes a
+            # strictly higher id from INCR, so it can never land below the floor.
             self.r.set(seen_key, str(last_id))
             self.r.expire(seen_key, DEFAULT_TTL_DAYS * 86400)
 
-        return {"project": p, "agent": agent, "count": len(messages), "messages": messages}
+        return {"project": p, "agent": agent, "count": len(messages),
+                "skipped": skipped, "messages": messages}
 
     # -------------------------------------------------------------------- read
     def read(self, project: str, message_id: str) -> Optional[dict]:
@@ -253,6 +345,32 @@ class RedisStore:
                 continue
             msgs.append(msg)
         return {"project": p, "count": len(msgs), "total": self.r.zcard(feed_key), "messages": msgs}
+
+    # ------------------------------------------------------------------ latest
+    def latest(self, project: str, limit: int = 5,
+               since_hours: Optional[float] = None) -> dict:
+        """The most recent messages in a project, newest first, WITHOUT touching any
+        watermark.
+
+        The orientation verb: a fresh context can see what is going on without consuming
+        anyone's unread backlog, and asking twice gives the same answer.
+        """
+        p = _slug(project)
+        feed_key = self._k(p, "feed")
+        cutoff = (self._now() - max(0.0, float(since_hours)) * 3600.0
+                  if since_hours is not None else None)
+
+        ids = self.r.zrevrange(feed_key, 0, _clamp_limit(limit) - 1)  # newest first
+        msgs = []
+        for msg_id in ids:
+            msg = self._load(p, msg_id, source_zset=feed_key)
+            if msg is None:
+                continue
+            if cutoff is not None and msg["created_at"] < cutoff:
+                continue
+            msgs.append(_summarize(msg))
+        return {"project": p, "count": len(msgs), "total": self.r.zcard(feed_key),
+                "messages": msgs}
 
     # ------------------------------------------------------------------ search
     def search(self, project: str, query: str, limit: int = 20) -> dict:

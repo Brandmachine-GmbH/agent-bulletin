@@ -16,7 +16,7 @@ reading project X sees the whole stream. `from` / `to` are metadata, not routing
 - **How:** [architecture.md](architecture.md)
 
 Inspired by [`mcp_agent_mail`](https://github.com/Dicklesworthstone/mcp_agent_mail), kept
-deliberately small: ~6 tools, plain Redis (no RediSearch / Redis Stack), 30-day TTL.
+deliberately small: ~7 tools, plain Redis (no RediSearch / Redis Stack), 30-day TTL.
 
 ## Requirements
 
@@ -47,7 +47,8 @@ runs against a real Redis when `REDIS_URL` is reachable and is skipped otherwise
 | Tool | Purpose |
 | --- | --- |
 | `post_message(project, from_agent, subject, body, to?, thread_id?, importance?, ttl_days?)` | Post a message to a project's feed. |
-| `check_mailbox(project, agent, limit?, mark_seen?)` | **Primary verb.** Get the messages this agent hasn't seen yet (oldest first), then advance its marker. |
+| `check_mailbox(project, agent, limit?, mark_seen?, bootstrap?, since_hours?)` | **Primary verb.** Get the messages this agent hasn't seen yet (oldest first), then advance its marker. |
+| `latest_messages(project, limit?, since_hours?)` | The newest messages, newest first. Read-only: advances nothing. |
 | `read_message(project, message_id)` | Read one full message by id. |
 | `search_messages(project, query, limit?)` | Full-text search (token AND) within a project. |
 | `get_thread(project, thread_id)` | All messages in a thread, chronological. |
@@ -57,12 +58,32 @@ All tools return `{"success": bool, ...}`; on failure, `{"success": false, "erro
 
 ### How "what's new" works
 
-Each `(project, agent)` pair has a **watermark** (a last-seen timestamp). `check_mailbox`
-returns feed entries newer than the watermark, then advances it to the last message
-returned. A second call right after returns nothing. A backlog larger than `limit` is
-drained over successive calls. Pass `mark_seen=False` to peek without advancing.
+Each `(project, agent)` pair has a **watermark**: the id of the last message that agent has
+seen. `check_mailbox` returns feed entries newer than the watermark, then advances it to the
+last message returned. A second call right after returns nothing. A backlog larger than
+`limit` is drained over successive calls. Pass `mark_seen=False` to peek without advancing.
 
 Different agents have independent watermarks, so each catches up on its own.
+
+### Starting at the recent end
+
+The watermark is keyed by the agent's exact name, so a new agent (or an existing one under a
+new name) has no watermark and would otherwise be handed the entire 30-day archive, oldest
+first. Two ways to stay at the recent end:
+
+- **`bootstrap`** (default `3`) caps what a reader gets on its *first* check of a project:
+  the newest few messages, with `skipped` reporting how much history it stepped over. Pass
+  `bootstrap=0` to start caught up (deliver nothing), or `bootstrap="all"` to replay the
+  project from the beginning. It has no effect once the agent has a watermark there.
+- **`since_hours`** limits any check to messages newer than N hours (`24` for "today").
+  Older ones count as seen, so they don't come back on the next check either.
+
+Both only ever push the watermark forward, so they can skip old messages but never
+re-deliver ones already seen.
+
+For a fresh context that just wants to look around, `latest_messages` is usually the better
+tool: it returns the newest messages without touching anyone's watermark, so it costs
+nothing and can be repeated.
 
 ## Example
 
@@ -115,15 +136,16 @@ and per-thread views.
 
 ## Redis layout (reference)
 
-Keys are namespaced by a sanitized project slug `p`:
+Keys are namespaced by a project slug `p` (lowercased, and every run of non-alphanumeric
+characters becomes a `-`, so `My Project`, `my_project` and `my-project` are one feed):
 
 | Key | Type | Purpose |
 | --- | --- | --- |
 | `am:{p}:seq` | string (INCR) | message id counter |
 | `am:{p}:msg:{id}` | hash | the message (carries TTL) |
-| `am:{p}:feed` | sorted set | the project stream (`score` = created_at) |
+| `am:{p}:feed` | sorted set | the project stream (`score` = message id) |
 | `am:{p}:thread:{tid}` | sorted set | messages in a thread |
-| `am:{p}:seen:{agent}` | string | a reader's watermark |
+| `am:{p}:seen:{agent}` | string | a reader's watermark (last-seen id) |
 | `am:{p}:idx:{token}` | set | search index bucket |
 | `am:projects` | sorted set | known projects by last activity |
 

@@ -9,9 +9,10 @@ import os
 import pytest
 import redis
 
-from agent_bulletin.store import RedisStore
+from agent_bulletin.store import RedisStore, _slug
 
 PROJECT = "_pytest_integration"
+SLUG = _slug(PROJECT)  # keys are built from the slug, not the raw name
 
 
 @pytest.fixture
@@ -37,4 +38,4 @@ def test_end_to_end_against_real_redis(real_store):
     assert real_store.check_mailbox(PROJECT, "reader")["count"] == 0  # watermark advanced
 
     assert real_store.search(PROJECT, "deploy")["count"] == 1
-    assert real_store.r.ttl(real_store._k(PROJECT, "msg", "1")) > 0
+    assert real_store.r.ttl(real_store._k(SLUG, "msg", "1")) > 0
