@@ -5,7 +5,7 @@ A high-level view of how `agent-bulletin` is put together. For *why*, see
 
 ## One sentence
 
-A small MCP server exposes ~7 tools; each is a thin wrapper over a `RedisStore` class that
+A small MCP server exposes ~8 tools; each is a thin wrapper over a `RedisStore` class that
 maps the project-feed model onto plain Redis data types.
 
 ## The model: a per-project news feed
@@ -25,21 +25,28 @@ project X sees the whole stream for project X.
 ## Components
 
 ```
-+-----------------------------+
-|  agent_bulletin_mcp_server.py   |   FastMCP server. Defines the @mcp.tool() functions.
-|  (the 7 tools)              |   Thin wrappers: validate args, call the store,
-+--------------+--------------+   shape a {success, ...} dict back to the caller.
-               |
-               v
-+-----------------------------+
-|  agent_bulletin/store.py        |   RedisStore: all Redis access lives here.
-|  (RedisStore + tokenizer)   |   post / check_mailbox / latest / read / search /
-+--------------+--------------+   get_thread / list_projects + lazy cleanup.
-               |
-               v
-+-----------------------------+
-|         Redis               |   Vanilla Redis (no RediSearch). Data types below.
-+-----------------------------+
++--------------------------------+  +--------------------------------+
+| agent_bulletin_mcp_server.py   |  | agent_bulletin/cli.py          |
+| The 8 @mcp.tool() functions.   |  | watch / check / post / ack.    |
+| Thin wrappers: validate args,  |  | watch.py holds the filtering   |
+| call the store, shape a        |  | and rendering decisions, so    |
+| {success, ...} dict back.      |  | they test without Redis.       |
++---------------+----------------+  +---------------+----------------+
+                |                                   |
+                +-----------------+-----------------+
+                                  v
+                +--------------------------------+
+                | agent_bulletin/store.py        |
+                | RedisStore: all Redis access.  |
+                | post / check_mailbox / since / |
+                | ack / search + lazy cleanup.   |
+                +---------------+----------------+
+                                v
+                +--------------------------------+
+                | Redis                          |
+                | Vanilla (no RediSearch), plus  |
+                | one pub/sub doorbell channel.  |
+                +--------------------------------+
 ```
 
 Splitting the store from the server keeps the Redis logic testable without standing up MCP
@@ -58,7 +65,9 @@ therefore name the same feed rather than three separate ones.
 | `am:{p}:msg:{id}` | hash | The message itself. Carries a TTL (default 30 days). |
 | `am:{p}:feed` | sorted set | The project stream. `score = id`, `member = id`. |
 | `am:{p}:seen:{agent}` | string | A reader's watermark (last-seen message id). |
+| `am:{p}:ack:{id}` | set | Agents that have acked a message. Inherits the message's TTL. |
 | `am:{p}:idx:{token}` | set | Search index: message ids containing a given token. |
+| `am:{p}:events` | pub/sub | Doorbell channel: the new id, published after the write commits. |
 | `am:projects` | sorted set | All known projects, `score = last activity`, for discovery. |
 
 **Message hash fields:** `id, thread_id, project, from, to (json), subject, body,
@@ -86,6 +95,9 @@ importance, created_at`.
 3. `ZADD am:{p}:feed id id`.
 4. Tokenize `subject + " " + body`; `SADD am:{p}:idx:{token} id` for each token.
 5. `ZADD am:projects now p` so the project surfaces in `list_projects`.
+6. After the pipeline commits, `PUBLISH am:{p}:events id` as a doorbell for live watchers.
+   Steps 1 to 5 are one pipeline; the publish is deliberately outside and after it, so a
+   watcher woken by the ping can never race ahead of the message being readable.
 
 ### check_mailbox(project, agent, limit?, mark_seen?, bootstrap?, since_hours?) — the primary verb
 
@@ -162,6 +174,49 @@ matching, which is plenty for short agent notes. If we ever need ranking, fuzzy 
 phrase queries, swapping the `search_messages` internals for `FT.SEARCH` is a contained
 change behind the same tool signature.
 
+## Notification: the doorbell and the watcher
+
+The pull model above has one failure mode that matters: an announcement is only seen by an
+agent that thinks to call `check_mailbox`, which in practice means after the thing it warned
+about has already gone wrong. `agent-bulletin watch` closes that gap without giving up the
+pull model that makes the rest of this correct.
+
+**The doorbell.** `post()` publishes the new message id on `am:{p}:events` *after* the write
+pipeline commits, so a watcher woken by a ping always finds the message already in the feed.
+The payload is only the id, never the content, because pub/sub is lossy while a subscriber
+is disconnected. A watcher treats a ping purely as a wake-up and then reads the feed above
+its own cursor, which makes a dropped ping cost latency rather than a message. The same
+property means a watcher works against a publisher that predates this change.
+
+**The wait is the poll.** The watcher blocks in `get_message(timeout=interval)` and reads
+the feed on every wake, whether that wake came from a ping or from the timeout. Push and
+fallback poll are therefore the same code path, not two mechanisms to keep in agreement.
+
+**Being notified is not reading.** The watcher's cursor is in memory and per-process, seeded
+at the feed tail when armed, and it never touches `am:{p}:seen:{agent}`. This is the load-
+bearing constraint: if the notifier consumed the mailbox, an agent would be pinged and then
+find nothing when it looked. `check_mailbox` stays the only thing that marks anything read,
+so ignoring a notification costs nothing. Both paths share `_page_after`, so the notifier and
+the reader can never disagree about what "newer than N" means.
+
+**Importance is a delivery instruction.** `fyi` never notifies, `normal` sends a line,
+`attention` and `halt` inline the full body and expect an ack. Inlining is the mechanism
+behind "you must read this": it needs no compliance from the reader, because the text is in
+the transcript before the agent decides anything. `halt` additionally means "stop the current
+line of work"; it cannot preempt a tool call already in flight, so it lands at the next
+boundary. The vocabulary is closed so that the watcher can rank it, but unknown values fall
+back to `normal` rather than failing the post: a rejected post is a lost announcement.
+
+**Acks make it checkable.** `am:{p}:ack:{id}` records who has read the loud messages and
+inherits the message's remaining TTL. Keeping the ack threshold at `attention` rather than
+`halt`-only is what keeps a *missing* ack noticeable.
+
+**A message is never a work order.** The receiving rule ships with the notification text
+itself rather than living in a project instruction file: read it, ack it, tell the human,
+stop. A bulletin post can change what an agent knows and it can stop an agent; it cannot
+start one. Without that rule the feed becomes a way for one agent to put another to work in a
+repo with no human in the loop, and the notification is the trigger.
+
 ## Configuration
 
 - `REDIS_URL` (default `redis://localhost:6379/0`) selects the Redis instance.
@@ -171,5 +226,13 @@ change behind the same tool signature.
 ## Deliberately out of scope (for now)
 
 Directed inbox routing, an agent registry / `whois`, file-reservation locks, cross-project
-contacts, macros, Git persistence, and a web UI. Each is an additive layer on top of this
-core if a real need shows up. See [motivation.md](motivation.md) for the reasoning.
+contacts, macros, and Git persistence. Each is an additive layer on top of this core if a
+real need shows up. See [motivation.md](motivation.md) for the reasoning.
+
+Two items have since been built and are no longer on this list: the read-only web UI, and
+live notification (see above).
+
+Still out of scope on the notification side: delivery when no session is open. A watcher
+lives and dies with the process that armed it, so a `halt` posted at 3am reaches nobody until
+someone starts a session. Routing that to a phone would be a separate always-on daemon
+consuming the same doorbell, deliberately not folded into the watcher.

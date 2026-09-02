@@ -26,6 +26,35 @@ MAX_LIMIT = 500       # upper bound on messages returned by a single call
 DEFAULT_BOOTSTRAP = 3  # messages a first-time reader gets instead of the whole archive
 PROJECTS_KEY = "am:projects"
 
+# Importance is a CLOSED vocabulary, ordered quietest to loudest, because each value
+# drives real delivery behaviour in the watcher rather than being a label:
+#
+#   fyi       no notification at all; surfaces only on the next check_mailbox
+#   normal    one-line notification (subject + snippet)
+#   attention notification with the FULL body inline, and an ack is expected
+#   halt      same as attention, plus "stop the current line of work and wait"
+#
+# Inlining the body is what makes "you must read this" real: once the text is in the
+# reader's transcript it has been read, with no compliance mechanism to trust. `halt`
+# still cannot preempt a tool call that is already running; it lands at the next
+# boundary. See architecture.md.
+IMPORTANCE_LEVELS = ("fyi", "normal", "attention", "halt")
+DEFAULT_IMPORTANCE = "normal"
+# The level from which a read receipt is expected. Keeping this at "attention" (rather
+# than halt-only) is deliberate: acks stay rare enough that a MISSING one is noticeable.
+ACK_FROM_IMPORTANCE = "attention"
+
+# Pre-vocabulary posts, and humans reaching for words the set does not have, land on the
+# nearest level instead of being rejected.
+_LEGACY_IMPORTANCE = {
+    "low": "fyi",
+    "info": "fyi",
+    "high": "attention",
+    "urgent": "halt",
+    "critical": "halt",
+}
+_IMPORTANCE_RANK = {name: i for i, name in enumerate(IMPORTANCE_LEVELS)}
+
 # Unicode-aware: \w matches letters/digits/underscore across scripts (accents, CJK, ...).
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 # Everything that is not a letter or digit collapses to "-", so "my_project", "my project"
@@ -88,6 +117,32 @@ def _normalize_agents(value: Union[None, str, list]) -> list:
     return [str(v).strip() for v in value if str(v).strip()]
 
 
+def normalize_importance(value: Optional[str]) -> str:
+    """Coerce a caller-supplied importance onto the closed vocabulary.
+
+    Unknown words fall back to the default rather than raising: a rejected post is a lost
+    announcement, and the whole point of the loud levels is that they arrive. Callers that
+    want to know they were misunderstood can compare the returned value.
+    """
+    s = (value or "").strip().lower()
+    if not s:
+        return DEFAULT_IMPORTANCE
+    s = _LEGACY_IMPORTANCE.get(s, s)
+    return s if s in _IMPORTANCE_RANK else DEFAULT_IMPORTANCE
+
+
+def importance_at_least(value: Optional[str], minimum: Optional[str]) -> bool:
+    """True when `value` is at least as loud as `minimum` on the importance scale."""
+    return _IMPORTANCE_RANK[normalize_importance(value)] >= _IMPORTANCE_RANK[
+        normalize_importance(minimum)
+    ]
+
+
+def requires_ack(value: Optional[str]) -> bool:
+    """True for levels where the sender is entitled to a read receipt."""
+    return importance_at_least(value, ACK_FROM_IMPORTANCE)
+
+
 def _iso(ts: float) -> str:
     """Render a unix timestamp as a UTC ISO-8601 string for human readability."""
     try:
@@ -114,7 +169,9 @@ def _hydrate(data: dict) -> dict:
         "to": to_list,
         "subject": data.get("subject", ""),
         "body": data.get("body", ""),
-        "importance": data.get("importance", "normal"),
+        # Normalized on read as well as on write, so messages posted before the closed
+        # vocabulary existed still rank and filter correctly.
+        "importance": normalize_importance(data.get("importance")),
         "created_at": created_at,
         "created_at_iso": _iso(created_at),
     }
@@ -131,6 +188,7 @@ def _summarize(msg: dict) -> dict:
         "to": msg["to"],
         "subject": msg["subject"],
         "importance": msg["importance"],
+        "requires_ack": requires_ack(msg["importance"]),
         "created_at": msg["created_at"],
         "created_at_iso": msg["created_at_iso"],
         "snippet": snippet,
@@ -150,6 +208,10 @@ class RedisStore:
     # ------------------------------------------------------------------ keys
     def _k(self, p: str, *parts: str) -> str:
         return ":".join(["am", p, *parts])
+
+    def events_channel(self, project: str) -> str:
+        """Pub/sub channel a watcher subscribes to for this project's doorbell pings."""
+        return self._k(_slug(project), "events")
 
     @staticmethod
     def _now() -> float:
@@ -219,6 +281,91 @@ class RedisStore:
             return None
         return _hydrate(data)
 
+    # -------------------------------------------------------------- paging
+    def _page_after(self, p: str, feed_key: str, after_id: int, lim: int):
+        """One page of messages strictly newer than `after_id`, oldest first.
+
+        The single ordering path shared by check_mailbox (which persists a watermark) and
+        since()/watch (which do not), so a notifier and a reader can never disagree about
+        what "newer than N" means.
+
+        Returns (messages, last_id, scanned). `last_id` advances past every id scanned,
+        including ones whose hash had expired, so an expired tail cannot wedge a cursor.
+        `scanned` distinguishes "found nothing" from "found only dangling ids".
+        """
+        ids = self.r.zrangebyscore(feed_key, f"({after_id}", "+inf", start=0, num=lim)
+        msgs = []
+        last_id = after_id
+        for msg_id in ids:
+            last_id = max(last_id, int(msg_id))
+            msg = self._load(p, msg_id, source_zset=feed_key)
+            if msg is None:
+                continue
+            msgs.append(msg)
+        return msgs, last_id, bool(ids)
+
+    def since(self, project: str, after_id: Union[int, str] = 0,
+              limit: int = MAX_LIMIT) -> dict:
+        """Full messages strictly newer than `after_id`, oldest first, with NO side effects.
+
+        The read primitive behind the watcher: it never touches `am:{p}:seen:{agent}`, so
+        being notified about a message does not consume it. The mailbox stays the only
+        thing that marks anything read.
+        """
+        p = _slug(project)
+        try:
+            after = max(0, int(after_id))
+        except (TypeError, ValueError):
+            after = 0
+        msgs, last_id, _ = self._page_after(p, self._k(p, "feed"), after, _clamp_limit(limit))
+        return {"project": p, "cursor": last_id, "count": len(msgs), "messages": msgs}
+
+    def backlog_cursor(self, project: str, keep: int = 0) -> int:
+        """Starting cursor for a watcher: leaves only the newest `keep` messages to deliver.
+
+        `keep=0` means "start at the tail", so arming a watch delivers what happens next
+        rather than replaying an archive nobody asked for.
+        """
+        p = _slug(project)
+        return self._bootstrap_floor(self._k(p, "feed"), max(0, int(keep)))
+
+    # --------------------------------------------------------------------- ack
+    def ack(self, project: str, message_id: str, agent: str) -> Optional[dict]:
+        """Record that `agent` has read a message. Returns None if it no longer exists.
+
+        Acks are how "everybody read this" becomes checkable instead of hoped for: the
+        poster (and the human) can see who is caught up on a change. The receipt inherits
+        the message's remaining TTL, so it dies with the message rather than outliving it.
+        """
+        p = _slug(project)
+        msg_key = self._k(p, "msg", str(message_id))
+        ttl = self.r.ttl(msg_key)
+        if ttl == -2 or not self.r.exists(msg_key):  # -2: key does not exist
+            return None
+        agent = (agent or "anonymous").strip() or "anonymous"
+        ack_key = self._k(p, "ack", str(message_id))
+        self.r.sadd(ack_key, agent)
+        if ttl and ttl > 0:
+            self.r.expire(ack_key, ttl)
+        return {"project": p, "message_id": str(message_id), "agent": agent,
+                "acked_by": self.acked_by(p, message_id)}
+
+    def acked_by(self, project: str, message_id: str) -> list:
+        """Agent names that have acked a message, sorted for a stable display order."""
+        p = _slug(project)
+        return sorted(self.r.smembers(self._k(p, "ack", str(message_id))) or [])
+
+    def _with_acks(self, p: str, msg: Optional[dict]) -> Optional[dict]:
+        """Attach the read receipts to a full message, but only where one is expected.
+
+        Skipped for fyi/normal so the common read path keeps costing exactly one Redis
+        call per message.
+        """
+        if msg is None or not requires_ack(msg.get("importance")):
+            return msg
+        msg["acked_by"] = self.acked_by(p, msg["id"])
+        return msg
+
     # -------------------------------------------------------------------- post
     def post(self, project: str, from_agent: str, subject: str, body: str,
              to: Union[None, str, list] = None, thread_id: Optional[str] = None,
@@ -237,7 +384,7 @@ class RedisStore:
             "to": json.dumps(to_list),
             "subject": subject or "",
             "body": body or "",
-            "importance": (importance or "normal").strip() or "normal",
+            "importance": normalize_importance(importance),
             "created_at": repr(created_at),
         }
         msg_key = self._k(p, "msg", msg_id)
@@ -258,7 +405,15 @@ class RedisStore:
         pipe.zadd(PROJECTS_KEY, {p: created_at})  # activity time, display/sort only
         pipe.execute()
 
-        return {"message_id": msg_id, "thread_id": thread_id, "project": p}
+        # Doorbell. Published only after the write commits, so a watcher woken by this
+        # ping always finds the message already in the feed. The payload is just the id:
+        # pub/sub is lossy while a subscriber is disconnected, so watchers must never
+        # treat a ping as the content. They re-read the feed above their own cursor, which
+        # makes a dropped ping cost latency (until the next poll tick) and never a message.
+        self.r.publish(self._k(p, "events"), msg_id)
+
+        return {"message_id": msg_id, "thread_id": thread_id, "project": p,
+                "importance": msg["importance"], "requires_ack": requires_ack(msg["importance"])}
 
     # ----------------------------------------------------------- check_mailbox
     def check_mailbox(self, project: str, agent: str, limit: int = 20,
@@ -295,19 +450,10 @@ class RedisStore:
         skipped = (self.r.zcount(feed_key, f"({stored}", watermark)
                    if watermark > stored else 0)
 
-        # ids strictly newer than the watermark, oldest (lowest id) first, capped at lim
-        ids = self.r.zrangebyscore(feed_key, f"({watermark}", "+inf", start=0, num=lim)
+        msgs, last_id, scanned = self._page_after(p, feed_key, watermark, lim)
+        messages = [_summarize(m) for m in msgs]
 
-        messages = []
-        last_id = watermark
-        for msg_id in ids:
-            last_id = max(last_id, int(msg_id))  # advance past every id we scanned
-            msg = self._load(p, msg_id, source_zset=feed_key)
-            if msg is None:
-                continue
-            messages.append(_summarize(msg))
-
-        if mark_seen and (ids or watermark > stored):
+        if mark_seen and (scanned or watermark > stored):
             # advance to the last id scanned this page; a backlog bigger than `lim` is
             # drained over successive checks rather than skipped. Nothing scanned and no
             # floor applied -> the watermark is left untouched (no wall-clock fallback to
@@ -324,7 +470,7 @@ class RedisStore:
     # -------------------------------------------------------------------- read
     def read(self, project: str, message_id: str) -> Optional[dict]:
         p = _slug(project)
-        return self._load(p, str(message_id))
+        return self._with_acks(p, self._load(p, str(message_id)))
 
     # --------------------------------------------------------------- list_feed
     def list_feed(self, project: str, limit: int = 200, offset: int = 0) -> dict:
@@ -343,7 +489,7 @@ class RedisStore:
             msg = self._load(p, msg_id, source_zset=feed_key)
             if msg is None:
                 continue
-            msgs.append(msg)
+            msgs.append(self._with_acks(p, msg))
         return {"project": p, "count": len(msgs), "total": self.r.zcard(feed_key), "messages": msgs}
 
     # ------------------------------------------------------------------ latest
@@ -406,7 +552,7 @@ class RedisStore:
                 continue
             msgs.append(msg)
 
-        msgs = msgs[: _clamp_limit(limit)]
+        msgs = [self._with_acks(p, m) for m in msgs[: _clamp_limit(limit)]]
         return {"project": p, "thread_id": str(thread_id), "count": len(msgs), "messages": msgs}
 
     # ----------------------------------------------------------- list_projects

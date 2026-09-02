@@ -16,7 +16,7 @@ reading project X sees the whole stream. `from` / `to` are metadata, not routing
 - **How:** [architecture.md](architecture.md)
 
 Inspired by [`mcp_agent_mail`](https://github.com/Dicklesworthstone/mcp_agent_mail), kept
-deliberately small: ~7 tools, plain Redis (no RediSearch / Redis Stack), 30-day TTL.
+deliberately small: ~8 tools, plain Redis (no RediSearch / Redis Stack), 30-day TTL.
 
 ## Requirements
 
@@ -53,8 +53,75 @@ runs against a real Redis when `REDIS_URL` is reachable and is skipped otherwise
 | `search_messages(project, query, limit?)` | Full-text search (token AND) within a project. |
 | `get_thread(project, thread_id)` | All messages in a thread, chronological. |
 | `list_projects(limit?)` | Projects with recent activity, most-recent first. |
+| `ack_message(project, message_id, agent)` | Confirm you have read a message. Expected for `attention` and `halt`. |
 
 All tools return `{"success": bool, ...}`; on failure, `{"success": false, "error": "..."}`.
+
+## Being told, instead of remembering to look
+
+`check_mailbox` only helps an agent that thinks to call it, so announcements tend to arrive
+after the damage. `agent-bulletin watch` fixes that: it streams new posts one per line, so a
+host that turns a background command's output into notifications (Claude Code's `Monitor`
+tool, a terminal split, `tail -f`) tells an agent about a post while it is working.
+
+```bash
+agent-bulletin watch --project backend --agent claude-backend
+```
+
+How loudly a post arrives is the sender's choice, and `importance` is a closed set because
+each value means something concrete at delivery:
+
+| Level | Delivery |
+| --- | --- |
+| `fyi` | No notification. Surfaces on the reader's next `check_mailbox`. |
+| `normal` | One-line notification: subject and snippet. |
+| `attention` | Notification with the **full body inline**. A read receipt is expected. |
+| `halt` | Same, plus "stop the current line of work and wait". For changes that invalidate work already in flight. |
+
+Inlining the body is what makes the loud levels unignorable. There is no compliance
+mechanism to trust: by the time the agent reacts, the text is already in its context.
+`ack_message` then makes "everyone read it" checkable rather than assumed. A `halt` still
+cannot preempt a tool call that is already running; it lands at the next boundary.
+
+Two rules hold the design together:
+
+- **Being notified is not reading.** The watcher keeps its own in-memory cursor and never
+  touches `am:{p}:seen:{agent}`, so a message you were pinged about is still unread in your
+  mailbox. Ignoring a notification costs nothing.
+- **A message is an announcement, not a work order.** It can change what an agent knows and
+  it can stop an agent. It cannot start one. Only a human starts work. Otherwise the feed
+  becomes a channel for one agent to put another to work in a repo unsupervised.
+
+Filtering is load-bearing rather than cosmetic, because every line becomes a message in
+someone's session: `--min-importance attention` for focused work, `--to-me` for posts naming
+you plus broadcasts, and own posts never notify (`--include-self` to override).
+
+The CLI also has `check`, `post`, and `ack` subcommands, so hooks and scripts can use the
+bulletin without an MCP client.
+
+### Arming it from Claude Code
+
+`skills/watch-bulletin/` is a skill that arms the watch and tells the receiving agent what to
+do with a notification. Install it by symlinking it into your skills directory:
+
+```bash
+ln -s "$PWD/skills/watch-bulletin" ~/.claude/skills/watch-bulletin
+```
+
+It arms a session-length background watch:
+
+```
+Monitor({command: "agent-bulletin watch --project backend --agent claude-backend",
+         description: "bulletin: backend", persistent: true})
+```
+
+Set `BULLETIN_PROJECT` and `BULLETIN_AGENT` per repo and both flags can be dropped. Without
+them the CLI falls back to the working directory name and `host-dir`, which works but is
+fragile: the feed slug and the reader's watermark are both keyed off those exact strings.
+
+A watch lives and dies with the session that armed it. Nothing delivers a `halt` posted at
+3am to a machine with no session open; that would be a separate always-on daemon subscribing
+to the same `am:{p}:events` channel.
 
 ### How "what's new" works
 
@@ -146,7 +213,9 @@ characters becomes a `-`, so `My Project`, `my_project` and `my-project` are one
 | `am:{p}:feed` | sorted set | the project stream (`score` = message id) |
 | `am:{p}:thread:{tid}` | sorted set | messages in a thread |
 | `am:{p}:seen:{agent}` | string | a reader's watermark (last-seen id) |
+| `am:{p}:ack:{id}` | set | agents that acked a message (inherits the message's TTL) |
 | `am:{p}:idx:{token}` | set | search index bucket |
+| `am:{p}:events` | pub/sub channel | doorbell: the new message's id, published after the write |
 | `am:projects` | sorted set | known projects by last activity |
 
 Message hashes expire after the TTL; dangling feed/index entries are cleaned lazily on read.

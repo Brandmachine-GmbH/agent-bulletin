@@ -97,9 +97,9 @@ def test_to_is_metadata_not_routing(store):
 
 
 def test_importance_defaults_and_stored(store):
-    store.post("p", "a", "s", "b", importance="high")
+    store.post("p", "a", "s", "b", importance="attention")
     store.post("p", "a", "s2", "b2")
-    assert store.read("p", "1")["importance"] == "high"
+    assert store.read("p", "1")["importance"] == "attention"
     assert store.read("p", "2")["importance"] == "normal"  # default
 
 

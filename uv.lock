@@ -23,6 +23,7 @@ dev = [
 ]
 web = [
     { name = "fastapi" },
+    { name = "markdown-it-py" },
     { name = "uvicorn" },
 ]
 
@@ -31,6 +32,7 @@ requires-dist = [
     { name = "fakeredis", marker = "extra == 'dev'", specifier = ">=2.20.0" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.110.0" },
     { name = "fastmcp", specifier = ">=0.7.0" },
+    { name = "markdown-it-py", marker = "extra == 'web'", specifier = ">=3.0.0" },
     { name = "mcp", specifier = ">=0.5.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "redis", specifier = ">=5.0.0" },

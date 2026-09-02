@@ -1,6 +1,6 @@
 [project]
 name = "agent-bulletin"
-version = "0.1.0"
+version = "0.2.0"
 description = "A tiny Redis-backed per-project news feed for AI agents, exposed via MCP"
 readme = "README.md"
 license = { text = "MIT" }
@@ -15,10 +15,14 @@ dependencies = [
     "redis>=5.0.0",
 ]
 
+[project.scripts]
+agent-bulletin = "agent_bulletin.cli:main"
+
 [project.optional-dependencies]
 web = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
+    "markdown-it-py>=3.0.0",
 ]
 dev = [
     "pytest>=8.0.0",

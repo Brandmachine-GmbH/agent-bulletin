@@ -15,11 +15,18 @@ from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from markdown_it import MarkdownIt
 
-from agent_bulletin.store import RedisStore
+from agent_bulletin.store import RedisStore, normalize_importance, requires_ack
 
 app = FastAPI(title="agent-bulletin")
 store = RedisStore()
+
+# Message bodies are authored by agents in Markdown. Render it, but keep the
+# CommonMark preset's raw-HTML pass-through OFF (html=False) so an agent can't
+# inject <script>/<img onerror> etc.; disallowed link protocols (javascript:,
+# data:) are left as inert text by markdown-it's default link validator.
+_MD = MarkdownIt("commonmark", {"html": False}).enable(["table", "strikethrough"])
 
 ACCENT = "#ff5500"  # Brandmachine orange
 
@@ -29,7 +36,8 @@ _LIGHT_VARS = (
     "--bg:#f7f7f8;--text:#1c1d21;--border:#e4e4e7;--muted:#6b7280;"
     "--card-bg:#ffffff;--card-border:#e9e9ec;--card-border-left:#d6d6da;--card-body:#3f4651;"
     "--input-bg:#ffffff;--input-border:#d0d0d4;--empty:#9aa0a8;"
-    "--badge-normal:#7b818c;--badge-low:#aeb3bb;"
+    "--badge-normal:#7b818c;--badge-low:#aeb3bb;--badge-attention:#c2410c;"
+    "--code-bg:#f4f4f6;--code-inline-bg:#ececef;--code-border:#e2e2e6;"
 )
 
 STYLE = f"""
@@ -38,7 +46,8 @@ STYLE = f"""
   --bg: #0f1115; --text: #e6e6e6; --border: #222; --muted: #888;
   --card-bg: #171a21; --card-border: #222; --card-border-left: #333; --card-body: #cfcfcf;
   --input-bg: #171a21; --input-border: #333; --empty: #777;
-  --badge-normal: #5a5f6a; --badge-low: #3a3f48;
+  --badge-normal: #5a5f6a; --badge-low: #3a3f48; --badge-attention: #b4531f;
+  --code-bg: #0d1117; --code-inline-bg: #252b34; --code-border: #2a2f37;
 }}
 [data-theme="light"] {{ {_LIGHT_VARS} }}
 @media (prefers-color-scheme: light) {{ :root:not([data-theme]) {{ {_LIGHT_VARS} }} }}
@@ -55,10 +64,39 @@ header h1 {{ font-size: 18px; margin: 0; }}
 .card {{ background: var(--card-bg); border: 1px solid var(--card-border); border-left: 3px solid var(--card-border-left);
          border-radius: 8px; padding: 14px 16px; margin: 0 0 12px;
          transition: background-color .15s ease, border-color .15s ease; }}
-.card.high {{ border-left-color: var(--accent); }}
+.card.loud {{ border-left-color: var(--accent); }}
 .card .subject {{ font-size: 15px; font-weight: 600; margin: 0 0 4px; }}
 .card .meta {{ color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
+.card .acks {{ margin-top: -4px; font-style: italic; }}
 .card .body {{ white-space: pre-wrap; font-size: 14px; line-height: 1.5; color: var(--card-body); }}
+.card .body.md {{ white-space: normal; word-wrap: break-word; overflow-wrap: anywhere; }}
+.body.md > :first-child {{ margin-top: 0; }}
+.body.md > :last-child {{ margin-bottom: 0; }}
+.body.md p {{ margin: 0 0 10px; }}
+.body.md ul, .body.md ol {{ margin: 0 0 10px; padding-left: 22px; }}
+.body.md li {{ margin: 2px 0; }}
+.body.md li > ul, .body.md li > ol {{ margin: 2px 0; }}
+.body.md h1, .body.md h2, .body.md h3, .body.md h4, .body.md h5, .body.md h6 {{
+  margin: 16px 0 8px; line-height: 1.3; font-weight: 600; color: var(--text); }}
+.body.md h1 {{ font-size: 19px; }}
+.body.md h2 {{ font-size: 17px; }}
+.body.md h3 {{ font-size: 15px; }}
+.body.md h4, .body.md h5, .body.md h6 {{ font-size: 14px; }}
+.body.md code {{ font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px; background: var(--code-inline-bg); border: 1px solid var(--code-border);
+  padding: 0.5px 5px; border-radius: 5px; }}
+.body.md pre {{ background: var(--code-bg); border: 1px solid var(--code-border); border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto; margin: 0 0 10px; }}
+.body.md pre code {{ background: none; border: 0; padding: 0; font-size: 12.5px; line-height: 1.45; }}
+.body.md blockquote {{ margin: 0 0 10px; padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--card-border-left); color: var(--muted); }}
+.body.md a {{ text-decoration: underline; }}
+.body.md img {{ max-width: 100%; height: auto; }}
+.body.md hr {{ border: 0; border-top: 1px solid var(--border); margin: 14px 0; }}
+.body.md table {{ border-collapse: collapse; margin: 0 0 10px; font-size: 13px;
+  display: block; overflow-x: auto; }}
+.body.md th, .body.md td {{ border: 1px solid var(--code-border); padding: 5px 10px; text-align: left; }}
+.body.md th {{ background: var(--code-inline-bg); font-weight: 600; }}
 .badge {{ display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px;
           color: #fff; vertical-align: middle; }}
 .proj {{ display: flex; justify-content: space-between; align-items: center; }}
@@ -71,20 +109,38 @@ header h1 {{ font-size: 18px; margin: 0; }}
 .theme-toggle:hover {{ border-color: var(--accent); }}
 """
 
+# Three theme modes: "auto" (no data-theme attribute, so the
+# prefers-color-scheme rule above decides), "light" and "dark". Auto is
+# represented by the ABSENCE of the attribute and of the localStorage key, which
+# is what lets the system preference keep winning after a page load.
+#
 # Set the saved theme before first paint to avoid a flash of the wrong theme.
+# Only light/dark are honoured: a stale or hand-edited value must fall back to
+# auto rather than set a data-theme no CSS rule matches.
 _HEAD_SCRIPT = (
     "<script>(function(){try{var t=localStorage.getItem('theme');"
-    "if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
+    "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}"
+    "catch(e){}})();</script>"
 )
 # Toggle handler + icon sync; runs on every (auto-refreshing) page load.
+# The icon shows the MODE, not the resolved colour, so that auto is visible as
+# its own state; without that, auto-on-a-dark-system and forced-dark would look
+# identical and the cycle would feel broken.
 _BODY_SCRIPT = (
-    "<script>function _bmTheme(){return document.documentElement.getAttribute('data-theme')||"
-    "(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');}"
-    "function _bmIcon(){var b=document.getElementById('theme-toggle');"
-    "if(b)b.textContent=_bmTheme()==='light'?'\\u2600\\ufe0f':'\\u263d';}"
-    "function toggleTheme(){var n=_bmTheme()==='light'?'dark':'light';"
-    "document.documentElement.setAttribute('data-theme',n);"
-    "try{localStorage.setItem('theme',n);}catch(e){}_bmIcon();}_bmIcon();</script>"
+    "<script>function _bmMode(){"
+    "return document.documentElement.getAttribute('data-theme')||'auto';}"
+    "function _bmIcon(){var b=document.getElementById('theme-toggle');if(!b)return;"
+    "var m=_bmMode();"
+    "b.textContent=m==='light'?'\\u2600\\ufe0f':m==='dark'?'\\u263d':'\\u25d0';"
+    "var l=m==='auto'?'Theme: auto (following system)':"
+    "m==='light'?'Theme: light':'Theme: dark';"
+    "b.title=l;b.setAttribute('aria-label',l+' \\u2013 click to change');}"
+    "function toggleTheme(){var n={auto:'light',light:'dark',dark:'auto'}[_bmMode()];"
+    "if(n==='auto'){document.documentElement.removeAttribute('data-theme');"
+    "try{localStorage.removeItem('theme');}catch(e){}}"
+    "else{document.documentElement.setAttribute('data-theme',n);"
+    "try{localStorage.setItem('theme',n);}catch(e){}}"
+    "_bmIcon();}_bmIcon();</script>"
 )
 
 
@@ -97,7 +153,7 @@ def _page(title: str, body: str, *, refresh: Optional[int] = None) -> str:
         f'<header><h1><a href="/">agent-bulletin</a></h1>'
         f'<span class="muted">{html.escape(title)}</span>'
         f'<button id="theme-toggle" class="theme-toggle" type="button" '
-        f'onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Toggle theme"></button>'
+        f'onclick="toggleTheme()" aria-label="Change theme" title="Change theme"></button>'
         f'</header>'
         f'<div class="wrap">{body}</div>{_BODY_SCRIPT}</body></html>'
     )
@@ -111,23 +167,49 @@ def _fmt(ts: float) -> str:
 
 
 def _badge(importance: str) -> str:
-    colors = {"high": "var(--accent)", "normal": "var(--badge-normal)", "low": "var(--badge-low)"}
-    c = colors.get(importance, "var(--badge-normal)")
-    return f'<span class="badge" style="background:{c}">{html.escape(importance or "normal")}</span>'
+    colors = {
+        "halt": "var(--accent)",
+        "attention": "var(--badge-attention)",
+        "normal": "var(--badge-normal)",
+        "fyi": "var(--badge-low)",
+    }
+    imp = normalize_importance(importance)
+    return (f'<span class="badge" style="background:{colors[imp]}">'
+            f'{html.escape(imp)}</span>')
 
 
-def _card(project: str, msg: dict, *, body_text: str) -> str:
-    imp = msg.get("importance", "normal")
-    cls = "card high" if imp == "high" else "card"
+def _acks(msg: dict) -> str:
+    """Read receipts for the levels that expect one.
+
+    Shown even when empty: an unacked halt is the thing worth seeing on a board, so the
+    absence has to be visible rather than just missing.
+    """
+    if not requires_ack(msg.get("importance")):
+        return ""
+    names = msg.get("acked_by") or []
+    text = ("read by " + ", ".join(html.escape(n) for n in names)) if names else "not acked yet"
+    return f'<div class="meta acks">{text}</div>'
+
+
+def _card(project: str, msg: dict, *, body_text: str, render_md: bool = True) -> str:
+    imp = normalize_importance(msg.get("importance"))
+    cls = "card loud" if requires_ack(imp) else "card"
     subject = html.escape(msg.get("subject") or "(no subject)")
     frm = html.escape(msg.get("from") or "unknown")
     tid = html.escape(str(msg.get("thread_id")))
     sp = html.escape(project)
+    # Full bodies are rendered Markdown (safe: html=False escapes raw tags).
+    # Search snippets are truncated excerpts, so we keep them as escaped
+    # plain text to avoid rendering broken/half-open Markdown.
+    if render_md:
+        body = f'<div class="body md">{_MD.render(body_text or "")}</div>'
+    else:
+        body = f'<div class="body">{html.escape(body_text or "")}</div>'
     return (
         f'<div class="{cls}"><div class="subject">{subject} {_badge(imp)}</div>'
         f'<div class="meta">from <b>{frm}</b> &middot; {_fmt(msg.get("created_at", 0))} '
         f'&middot; <a href="/p/{sp}/thread/{tid}">thread {tid}</a></div>'
-        f'<div class="body">{html.escape(body_text or "")}</div></div>'
+        f'{_acks(msg)}{body}</div>'
     )
 
 
@@ -157,7 +239,9 @@ def board(project: str, q: Optional[str] = None) -> str:
     )
     if q:
         msgs = store.search(project, q, limit=100).get("messages", [])
-        cards = "".join(_card(project, m, body_text=m.get("snippet", "")) for m in msgs)
+        cards = "".join(
+            _card(project, m, body_text=m.get("snippet", ""), render_md=False) for m in msgs
+        )
         head = (f'<p class="muted">{len(msgs)} result(s) for "{html.escape(q)}" '
                 f'&middot; <a href="/p/{sp}">clear</a></p>')
         body = search_box + head + (cards or '<div class="empty">No matches.</div>')
