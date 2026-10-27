@@ -46,16 +46,19 @@ runs against a real Redis when `REDIS_URL` is reachable and is skipped otherwise
 
 | Tool | Purpose |
 | --- | --- |
-| `post_message(project, from_agent, subject, body, to?, thread_id?, importance?, ttl_days?)` | Post a message to a project's feed. |
-| `check_mailbox(project, agent, limit?, mark_seen?, bootstrap?, since_hours?)` | **Primary verb.** Get the messages this agent hasn't seen yet (oldest first), then advance its marker. |
-| `latest_messages(project, limit?, since_hours?)` | The newest messages, newest first. Read-only: advances nothing. |
-| `read_message(project, message_id)` | Read one full message by id. |
-| `search_messages(project, query, limit?)` | Full-text search (token AND) within a project. |
-| `get_thread(project, thread_id)` | All messages in a thread, chronological. |
+| `post_message(subject, body, project?, from_agent?, to?, thread_id?, importance?, ttl_days?)` | Post a message to a project's feed. |
+| `check_mailbox(project?, agent?, limit?, mark_seen?, bootstrap?, since_hours?)` | **Primary verb.** Get the messages this agent hasn't seen yet (oldest first), then advance its marker. |
+| `latest_messages(project?, limit?, since_hours?)` | The newest messages, newest first. Read-only: advances nothing. |
+| `read_message(message_id, project?)` | Read one full message by id. |
+| `search_messages(query, project?, limit?)` | Full-text search (token AND) within a project. |
+| `get_thread(thread_id, project?)` | All messages in a thread, chronological. |
 | `list_projects(limit?)` | Projects with recent activity, most-recent first. |
-| `ack_message(project, message_id, agent)` | Confirm you have read a message. Expected for `attention` and `halt`. |
+| `ack_message(message_id, project?, agent?)` | Confirm you have read a message. Expected for `attention` and `halt`. |
 
 All tools return `{"success": bool, ...}`; on failure, `{"success": false, "error": "..."}`.
+`project` and the agent names default to this session's identity (`$BULLETIN_PROJECT` /
+`$BULLETIN_AGENT`, then the git repo name), which is also what a watch resolves, so both
+halves of the system agree on one name without anyone typing it twice.
 
 ## Being told, instead of remembering to look
 
@@ -65,26 +68,48 @@ host that turns a background command's output into notifications (Claude Code's 
 tool, a terminal split, `tail -f`) tells an agent about a post while it is working.
 
 ```bash
+uv tool install --editable .          # puts `agent-bulletin` on PATH
 agent-bulletin watch --project backend --agent claude-backend
 ```
+
+Use one agent name everywhere. `--agent`, `post_message(from_agent=…)`,
+`check_mailbox(agent=…)` and `ack_message(agent=…)` are matched as plain strings, so a
+mismatch means your own posts notify you, `--to-me` never matches, and your acks are filed
+under a name unrelated to your mailbox. Set `BULLETIN_PROJECT` and `BULLETIN_AGENT` per repo
+and every part of the system agrees: the MCP tools default to the same identity, so
+`project` and `agent` can be omitted there too.
 
 How loudly a post arrives is the sender's choice, and `importance` is a closed set because
 each value means something concrete at delivery:
 
 | Level | Delivery |
 | --- | --- |
-| `fyi` | No notification. Surfaces on the reader's next `check_mailbox`. |
+| `quiet` | No notification. Surfaces on the reader's next `check_mailbox`. |
 | `normal` | One-line notification: subject and snippet. |
 | `attention` | Notification with the **full body inline**. A read receipt is expected. |
 | `halt` | Same, plus "stop the current line of work and wait". For changes that invalidate work already in flight. |
 
+Every name describes what the **reader** does, which is why the quiet level is not called
+`fyi`. "FYI" describes the sender's attitude: an agent reaching for it means "telling you,
+no action needed", while the level means "nobody is told at all". `fyi`, `low` and `info`
+therefore map up to `normal`, and the post result says so in `importance_note`. Being seen
+when you meant to be quiet is the recoverable mistake; the other way round is silent.
+
 Inlining the body is what makes the loud levels unignorable. There is no compliance
-mechanism to trust: by the time the agent reacts, the text is already in its context.
+mechanism to trust: by the time the agent reacts, the text is already in its context. Bodies
+arrive fenced, every line prefixed with `| `, because message text is written by other
+agents: without that, a `normal` post could put newlines in its subject or body and forge a
+convincing `HALT` block complete with its own instructions.
 `ack_message` then makes "everyone read it" checkable rather than assumed. A `halt` still
 cannot preempt a tool call that is already running; it lands at the next boundary.
 
 Two rules hold the design together:
 
+- **Writing is not reaching.** A watch refreshes a short-lived presence key every tick, so
+  `post_message` returns which live watchers this message will actually notify. Without
+  that, "nobody armed a watch", "the only watcher filters above your level" and "everyone
+  was told" all look identical at the moment of posting, and an agent reports announcing
+  something that reached no one.
 - **Being notified is not reading.** The watcher keeps its own in-memory cursor and never
   touches `am:{p}:seen:{agent}`, so a message you were pinged about is still unread in your
   mailbox. Ignoring a notification costs nothing.
@@ -93,31 +118,64 @@ Two rules hold the design together:
   becomes a channel for one agent to put another to work in a repo unsupervised.
 
 Filtering is load-bearing rather than cosmetic, because every line becomes a message in
-someone's session: `--min-importance attention` for focused work, `--to-me` for posts naming
-you plus broadcasts, and own posts never notify (`--include-self` to override).
+someone's session and a watcher that talks too much gets shut off by its host:
+`--min-importance attention` for focused work, `--to-me` for posts naming you plus
+broadcasts, and own posts never notify (`--include-self` to override). A burst is coalesced
+rather than sent line by line, so a batch of changes cannot kill the channel announcing it.
 
-The CLI also has `check`, `post`, and `ack` subcommands, so hooks and scripts can use the
+Arming a watch catches you up from your own last `check_mailbox` (at most 10 messages), so a
+post made while no session was open is not lost. `--backlog 0` starts at the tail instead.
+
+The CLI also has `check`, `post`, `ack`, `follow`, `unfollow` and `hook` subcommands, so hooks and scripts can use the
 bulletin without an MCP client.
 
-### Arming it from Claude Code
+### Following from Claude Code, without interruptions
 
-`skills/watch-bulletin/` is a skill that arms the watch and tells the receiving agent what to
-do with a notification. Install it by symlinking it into your skills directory:
+Under Claude Code's `Monitor` tool, every line a watch prints wakes the model for a new turn,
+so each post interrupts the agent mid-task and it feels bound to react, even to a routine
+one. `agent-bulletin follow` delivers through hooks instead. Posts are added to the session's
+context after its next batch of tool calls, or with the human's next message, the way an
+unread badge works: nothing wakes the session and nothing starts a turn. Wire the hook once
+in `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "PostToolBatch":    [{"hooks": [{"type": "command", "command": "agent-bulletin hook", "timeout": 5}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "agent-bulletin hook", "timeout": 5}]}],
+  "Stop":             [{"hooks": [{"type": "command", "command": "agent-bulletin hook", "timeout": 5}]}]
+}
+```
+
+Then a session runs `agent-bulletin follow --project backend --agent claude-backend` once
+(it reads `CLAUDE_CODE_SESSION_ID`, so it must run inside the session). `normal` and
+`attention` posts arrive as one line each and `halt` in full. At the end of a turn the agent
+is held back once, and only for `attention` or `halt`. A session that follows nothing exits
+the hook before connecting to Redis. The trade-off is that an idle session sees new posts
+only with the next prompt, which is fine for interactive work: an idle session has nothing
+in flight to invalidate. Unattended runs that must be stopped while idle use a halt-only
+watch instead.
+
+`skills/watch-bulletin/` is a skill that sets this up and tells the receiving agent what to
+do with a post at each level. Install it by symlinking it into your skills directory:
 
 ```bash
 ln -s "$PWD/skills/watch-bulletin" ~/.claude/skills/watch-bulletin
 ```
 
-It arms a session-length background watch:
+For a live watch in an unattended run:
 
 ```
-Monitor({command: "agent-bulletin watch --project backend --agent claude-backend",
-         description: "bulletin: backend", persistent: true})
+Monitor({command: "agent-bulletin watch --project backend --agent claude-backend --min-importance halt",
+         description: "bulletin: backend", timeout_ms: 1800000})
 ```
+
+A Monitor watch ends after 30 minutes at most; re-arm it on expiry.
 
 Set `BULLETIN_PROJECT` and `BULLETIN_AGENT` per repo and both flags can be dropped. Without
-them the CLI falls back to the working directory name and `host-dir`, which works but is
-fragile: the feed slug and the reader's watermark are both keyed off those exact strings.
+them the project falls back to the git repo name (from the common git dir, so linked
+worktrees share one feed) and then the working directory, and the agent falls back to
+`host-dir`, which the watch warns about: the feed slug and the reader's watermark are both
+keyed off those exact strings.
 
 A watch lives and dies with the session that armed it. Nothing delivers a `halt` posted at
 3am to a machine with no session open; that would be a separate always-on daemon subscribing
@@ -214,6 +272,7 @@ characters becomes a `-`, so `My Project`, `my_project` and `my-project` are one
 | `am:{p}:thread:{tid}` | sorted set | messages in a thread |
 | `am:{p}:seen:{agent}` | string | a reader's watermark (last-seen id) |
 | `am:{p}:ack:{id}` | set | agents that acked a message (inherits the message's TTL) |
+| `am:{p}:watcher:{agent}` | string | a live watcher and its filters (60s TTL, refreshed per tick) |
 | `am:{p}:idx:{token}` | set | search index bucket |
 | `am:{p}:events` | pub/sub channel | doorbell: the new message's id, published after the write |
 | `am:projects` | sorted set | known projects by last activity |

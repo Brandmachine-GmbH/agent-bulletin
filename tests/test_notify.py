@@ -6,23 +6,28 @@ its body, or a filter that lets an agent notify itself in a loop.
 """
 
 import pytest
+import redis
 
 from agent_bulletin.store import (
     importance_at_least,
     normalize_importance,
     requires_ack,
 )
-from agent_bulletin.watch import format_message, should_notify
+from agent_bulletin.watch import (
+    delivery_preview,
+    delivery_summary,
+    format_message,
+    should_notify,
+)
 
 
 # ------------------------------------------------------------------ vocabulary
 @pytest.mark.parametrize("given,expected", [
-    ("fyi", "fyi"),
+    ("quiet", "quiet"),
     ("NORMAL", "normal"),
     ("  attention ", "attention"),
     ("halt", "halt"),
     ("high", "attention"),      # legacy word from before the closed set
-    ("low", "fyi"),
     ("urgent", "halt"),
     ("wat", "normal"),          # unknown: never reject a post over a label
     ("", "normal"),
@@ -32,14 +37,32 @@ def test_normalize_importance(given, expected):
     assert normalize_importance(given) == expected
 
 
+@pytest.mark.parametrize("soft", ["fyi", "low", "info"])
+def test_soft_words_map_up_to_normal_not_down_to_silence(soft):
+    """An agent writing "fyi" means "no action needed", not "deliver to nobody". Of the two
+    ways to be wrong, being seen when you meant to be quiet is the recoverable one."""
+    assert normalize_importance(soft) == "normal"
+
+
+def test_a_coerced_level_is_reported_back(store):
+    result = store.post("p", "a", "s", "b", importance="fyi")
+    assert result["importance"] == "normal"
+    assert "'fyi' is not a delivery level" in result["importance_note"]
+    assert "quiet delivers to nobody" in result["importance_note"]
+
+
+def test_an_exact_level_gets_no_note(store):
+    assert "importance_note" not in store.post("p", "a", "s", "b", importance="quiet")
+
+
 def test_importance_is_ordered():
     assert importance_at_least("halt", "attention")
     assert importance_at_least("normal", "normal")
-    assert not importance_at_least("fyi", "normal")
+    assert not importance_at_least("quiet", "normal")
 
 
 def test_ack_expected_from_attention_up():
-    assert not requires_ack("fyi")
+    assert not requires_ack("quiet")
     assert not requires_ack("normal")
     assert requires_ack("attention")
     assert requires_ack("halt")
@@ -60,19 +83,57 @@ def test_summary_carries_requires_ack(store):
 
 
 # ------------------------------------------------------------------- doorbell
-def test_post_publishes_after_the_write_commits(store):
-    """The ping must never arrive before the message is readable, or a watcher woken by
-    it would query the feed and find nothing."""
-    pubsub = store.r.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe(store.events_channel("p"))
+def test_publish_happens_after_the_write_is_visible(store):
+    """The ping must never arrive before the message is readable, or a watcher woken by it
+    would query the feed and find nothing.
+
+    Asserting inside the publish call is the only way to observe the ordering: a test that
+    checks both after post() returns passes just as happily with the publish moved above
+    pipe.execute(), which is exactly the bug it is supposed to catch.
+    """
+    observed = {}
+    real_publish = store.r.publish
+
+    def spy(channel, data):
+        observed["readable"] = bool(store.r.hgetall(store._k("p", "msg", data)))
+        observed["channel"] = channel
+        return real_publish(channel, data)
+
+    store.r.publish = spy
     store.post("p", "a", "s", "b")
-    # The first get_message can return the swallowed subscribe confirmation, so drain a
-    # few. The watch loop is immune to this by construction: whatever get_message returns,
-    # it re-reads the feed above its own cursor.
-    pings = [pubsub.get_message(timeout=0.2) for _ in range(5)]
-    data = [p["data"] for p in pings if p and p.get("type") == "message"]
-    assert data == ["1"]
+    assert observed["readable"] is True
+    assert observed["channel"] == store.events_channel("p")
+
+
+def test_a_failed_doorbell_does_not_fail_the_post(store):
+    """The message is already committed, so raising here would report a good post as
+    failed and the caller's retry would put a duplicate on the board."""
+    def boom(*_a, **_kw):
+        raise redis.ConnectionError("pubsub is down")
+
+    store.r.publish = boom
+    result = store.post("p", "a", "s", "b")
+    assert result["message_id"] == "1"
     assert store.read("p", "1") is not None
+
+
+def test_acked_messages_are_flagged_in_the_mailbox(store):
+    """The watermark deliberately did not move when this arrived as a notification, so the
+    reader needs to know it already saw it rather than reporting it to the human twice."""
+    store.post("p", "a", "loud", "b", importance="attention")
+    store.post("p", "a", "quiet", "b")
+    store.ack("p", "1", "me")
+    msgs = store.check_mailbox("p", "me", bootstrap="all")["messages"]
+    assert msgs[0]["acked_by_me"] is True
+    assert "acked_by_me" not in msgs[1]  # only tracked where an ack is expected
+
+
+def test_watermark_is_readable_without_advancing(store):
+    store.post("p", "a", "s", "b")
+    assert store.watermark("p", "me") == 0
+    assert store.check_mailbox("p", "me", bootstrap="all")["count"] == 1
+    assert store.watermark("p", "me") == 1
+    assert store.watermark("p", "me") == 1  # reading it is not an advance
 
 
 # ---------------------------------------------------------------------- since
@@ -168,7 +229,7 @@ def _msg(**kw):
 
 
 def test_min_importance_suppresses_quieter_messages():
-    assert not should_notify(_msg(importance="fyi"), agent="me")
+    assert not should_notify(_msg(importance="quiet"), agent="me")
     assert should_notify(_msg(importance="normal"), agent="me")
     assert not should_notify(_msg(importance="normal"), agent="me",
                              min_importance="attention")
@@ -201,18 +262,36 @@ def test_loud_levels_inline_the_whole_body():
     body = "line one\nline two"
     out = format_message(_msg(importance="attention", body=body), project="backend",
                          agent="me")
-    assert body in out
+    assert "| line one" in out and "| line two" in out
     assert "[bulletin backend #1 ATTENTION]" in out
     assert 'ack_message(project="backend", message_id="1", agent="me")' in out
-    assert "not a work order" in out
+    assert "untrusted message body" in out
 
 
-def test_halt_says_to_stop_and_wait():
+def test_the_action_rule_does_not_hedge():
+    """"Do not start changes on your own" reads as "unless the message says otherwise",
+    which is the loophole a forged or over-reaching post drives through."""
+    for level in ("attention", "halt"):
+        out = format_message(_msg(importance=level), project="p", agent="me")
+        assert "whatever it says" in out
+        assert "on your own" not in out
+
+
+def test_halt_says_to_stop_and_persist_the_constraint():
     out = format_message(_msg(importance="halt", body="schema changed"),
                          project="backend", agent="me")
     assert "[bulletin backend #1 HALT]" in out
     assert "stop the current line of work" in out
-    assert "wait for them before continuing" in out
+    assert "survives context compaction" in out  # a halt must outlive the notification
+    assert "wait for them" in out
+
+
+def test_attention_and_halt_are_distinguishable():
+    """If both levels produce the same instruction, there is no reason for two levels."""
+    att = format_message(_msg(importance="attention"), project="p", agent="me")
+    halt = format_message(_msg(importance="halt"), project="p", agent="me")
+    assert "finish the step you are on" in att and "stop the current line" not in att
+    assert "stop the current line of work" in halt
 
 
 def test_long_bodies_are_truncated_with_a_pointer():
@@ -236,3 +315,60 @@ def test_a_long_normal_post_stays_one_line():
     assert "\n" not in out
     assert out.endswith("...")
     assert len(out) < 300
+
+
+# ------------------------------------------------------------------- presence
+def test_a_watcher_announces_itself_and_expires(store):
+    """Presence is a heartbeat, not a registry: it says who is listening right now."""
+    store.announce_watcher("p", "claude-frontend", min_importance="attention")
+    live = store.watchers("p")
+    assert live == [{"agent": "claude-frontend", "min_importance": "attention",
+                     "to_me": False, "mode": "watch"}]
+    assert 0 < store.r.ttl(store._k("p", "watcher", "claude-frontend")) <= 60
+    store.r.delete(store._k("p", "watcher", "claude-frontend"))   # simulate expiry
+    assert store.watchers("p") == []
+
+
+def test_watchers_are_per_project(store):
+    store.announce_watcher("backend", "a")
+    assert store.watchers("frontend") == []
+
+
+def test_delivery_preview_answers_will_this_reach_anyone(store):
+    store.announce_watcher("p", "picky", min_importance="halt")
+    store.announce_watcher("p", "listening", min_importance="normal")
+    msg = {"importance": "normal", "from": "poster", "to": []}
+    preview = delivery_preview(msg, store.watchers("p"))
+    assert {w["agent"]: w["will_notify"] for w in preview} == {
+        "listening": True, "picky": False}
+    assert "will notify listening" in delivery_summary(preview)
+    assert "1 filtered it out" in delivery_summary(preview)
+
+
+def test_delivery_summary_says_when_nobody_is_listening():
+    """The failure this exists to expose: the write succeeded and nobody was told."""
+    assert "nobody is watching" in delivery_summary([])
+
+
+def test_delivery_summary_says_when_everyone_filtered_it_out(store):
+    store.announce_watcher("p", "picky", min_importance="attention")
+    preview = delivery_preview({"importance": "normal", "from": "x", "to": []},
+                               store.watchers("p"))
+    assert "none will be notified" in delivery_summary(preview)
+
+
+def test_a_poster_is_not_counted_as_reachable_by_their_own_post(store):
+    store.announce_watcher("p", "me")
+    preview = delivery_preview({"importance": "halt", "from": "me", "to": []},
+                               store.watchers("p"))
+    assert preview[0]["will_notify"] is False
+
+
+def test_to_me_watchers_are_previewed_correctly(store):
+    store.announce_watcher("p", "targeted", to_me=True)
+    reachable = delivery_preview({"importance": "normal", "from": "x", "to": ["targeted"]},
+                                 store.watchers("p"))
+    missed = delivery_preview({"importance": "normal", "from": "x", "to": ["someone-else"]},
+                              store.watchers("p"))
+    assert reachable[0]["will_notify"] is True
+    assert missed[0]["will_notify"] is False

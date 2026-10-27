@@ -29,26 +29,38 @@ PROJECTS_KEY = "am:projects"
 # Importance is a CLOSED vocabulary, ordered quietest to loudest, because each value
 # drives real delivery behaviour in the watcher rather than being a label:
 #
-#   fyi       no notification at all; surfaces only on the next check_mailbox
+#   quiet     no notification at all; surfaces only on the next check_mailbox
 #   normal    one-line notification (subject + snippet)
 #   attention notification with the FULL body inline, and an ack is expected
 #   halt      same as attention, plus "stop the current line of work and wait"
+#
+# Every name describes what the READER does about it. That is why the quiet level is not
+# called "fyi": "FYI" describes the sender's attitude, and an agent reaching for it means
+# "telling you, no action needed" while the level means "nobody is told at all". Naming it
+# by tone made the two easy to confuse, and the failure was silent.
 #
 # Inlining the body is what makes "you must read this" real: once the text is in the
 # reader's transcript it has been read, with no compliance mechanism to trust. `halt`
 # still cannot preempt a tool call that is already running; it lands at the next
 # boundary. See architecture.md.
-IMPORTANCE_LEVELS = ("fyi", "normal", "attention", "halt")
+IMPORTANCE_LEVELS = ("quiet", "normal", "attention", "halt")
 DEFAULT_IMPORTANCE = "normal"
 # The level from which a read receipt is expected. Keeping this at "attention" (rather
 # than halt-only) is deliberate: acks stay rare enough that a MISSING one is noticeable.
 ACK_FROM_IMPORTANCE = "attention"
+# How long a watcher's presence key survives without a refresh. Comfortably longer than a
+# default poll tick, so a slow tick does not make a live watcher flicker out of existence.
+WATCHER_TTL = 60
 
-# Pre-vocabulary posts, and humans reaching for words the set does not have, land on the
-# nearest level instead of being rejected.
+# Words outside the set land on the nearest level instead of being rejected: a post
+# refused over a label is a lost announcement. The soft words map UP to `normal` rather
+# than down to `quiet` on purpose. Someone writing "fyi" or "low" is saying "this is not
+# urgent", not "deliver this to nobody", and of the two ways to be wrong, being seen when
+# you meant to be quiet is the recoverable one.
 _LEGACY_IMPORTANCE = {
-    "low": "fyi",
-    "info": "fyi",
+    "fyi": "normal",
+    "info": "normal",
+    "low": "normal",
     "high": "attention",
     "urgent": "halt",
     "critical": "halt",
@@ -73,6 +85,12 @@ def _slug(project: Optional[str]) -> str:
     s = (project or "default").strip().lower()
     s = _SLUG_RE.sub("-", s).strip("-")
     return s or "default"
+
+
+def project_slug(project: Optional[str]) -> str:
+    """The feed slug a project name maps to. Public so callers can de-duplicate names that
+    collapse to the same feed before giving each its own cursor."""
+    return _slug(project)
 
 
 def _tokenize(text: str) -> set:
@@ -327,7 +345,98 @@ class RedisStore:
         rather than replaying an archive nobody asked for.
         """
         p = _slug(project)
-        return self._bootstrap_floor(self._k(p, "feed"), max(0, int(keep)))
+        return self._bootstrap_floor(self._k(p, "feed"), max(0, int(keep or 0)))
+
+    def watermark(self, project: str, agent: str) -> int:
+        """This reader's last-seen id, 0 if it has never checked here. Read-only.
+
+        Exposed so a watcher can start where the reader actually left off instead of at the
+        feed tail. Reading the watermark is safe; only `check_mailbox` may advance it.
+        """
+        p = _slug(project)
+        agent = (agent or "anonymous").strip() or "anonymous"
+        raw = self.r.get(self._k(p, "seen", agent))
+        try:
+            return int(raw) if raw is not None else 0
+        except (ValueError, TypeError):
+            return 0
+
+    def id_counter(self, project: str) -> int:
+        """The highest id ever issued in this project, 0 if none. Read-only.
+
+        This, not the newest id still in the feed, is how a reader detects that the id
+        sequence was reset. The feed's newest id can drop below a reader's cursor without
+        any reset: `ttl_days` is per message, so the newest post can expire first and be
+        removed lazily, and a check against the feed then mistook that for a reset and
+        replayed the whole feed. The counter only goes down when the project is flushed.
+        """
+        raw = self.r.get(self._k(_slug(project), "seq"))
+        try:
+            return int(raw) if raw is not None else 0
+        except (ValueError, TypeError):
+            return 0
+
+    # ---------------------------------------------------------------- presence
+    def announce_watcher(self, project: str, agent: str, *,
+                         min_importance: str = DEFAULT_IMPORTANCE,
+                         to_me: bool = False, mode: str = "watch",
+                         ttl: int = WATCHER_TTL) -> None:
+        """Refresh this watcher's presence. Called on arming and on every poll tick.
+
+        Presence exists to answer one question a poster otherwise cannot: is anyone
+        actually listening? Without it, "nobody armed a watch", "the only watcher filters
+        above your level", and "everyone was told" are indistinguishable at the moment of
+        posting, so an agent reports that it announced something when nothing was
+        delivered. That is the exact state this whole feature was built to escape.
+
+        Deliberately NOT an agent registry (which architecture.md rules out): the key
+        expires, so it records who is listening right now and nothing else. There is no
+        roster, no history, and no identity beyond the name the watcher chose.
+        """
+        agent = (agent or "anonymous").strip() or "anonymous"
+        payload = json.dumps({
+            "agent": agent,
+            "min_importance": normalize_importance(min_importance),
+            "to_me": bool(to_me),
+            # "watch" is told immediately; "follow" sees the post at its next tool batch or
+            # prompt. A poster needs the difference to say truthfully when it will land.
+            "mode": mode,
+        })
+        # A plain key with a TTL rather than a field in a hash: Redis expires it for us, so
+        # a watcher that dies leaves nothing to sweep up and no stale presence to filter.
+        self.r.set(self._presence_key(_slug(project), agent, mode), payload,
+                   ex=max(1, int(ttl)))
+
+    def _presence_key(self, p: str, agent: str, mode: str) -> str:
+        # Followers get their own key prefix. Sharing one key per agent let a live watch's
+        # 60-second heartbeat overwrite a follower's entry (and its filter level) under the
+        # same name, so posters were told the wrong thing about who would see a post.
+        return self._k(p, "follower" if mode == "follow" else "watcher", agent)
+
+    def withdraw_watcher(self, project: str, agent: str, mode: str = "watch") -> None:
+        """Drop presence at once, so posters stop hearing about a reader that left."""
+        agent = (agent or "anonymous").strip() or "anonymous"
+        self.r.delete(self._presence_key(_slug(project), agent, mode))
+
+    def watchers(self, project: str) -> list:
+        """Watchers currently live on a project, by name.
+
+        A heartbeat proves a process is running; it does not prove the agent will act on
+        what it receives. Read it as "who could be told", not as a guarantee.
+        """
+        p = _slug(project)
+        found = []
+        keys = [*self.r.scan_iter(match=self._k(p, "watcher", "*")),
+                *self.r.scan_iter(match=self._k(p, "follower", "*"))]
+        for key in keys:
+            raw = self.r.get(key)
+            if not raw:
+                continue  # expired between the scan and the read
+            try:
+                found.append(json.loads(raw))
+            except (ValueError, TypeError):
+                continue
+        return sorted(found, key=lambda w: w.get("agent", ""))
 
     # --------------------------------------------------------------------- ack
     def ack(self, project: str, message_id: str, agent: str) -> Optional[dict]:
@@ -358,8 +467,10 @@ class RedisStore:
     def _with_acks(self, p: str, msg: Optional[dict]) -> Optional[dict]:
         """Attach the read receipts to a full message, but only where one is expected.
 
-        Skipped for fyi/normal so the common read path keeps costing exactly one Redis
-        call per message.
+        Skipped for fyi/normal so the ordinary read path keeps costing exactly one Redis
+        call per message. A board made entirely of attention/halt messages does pay a
+        second round trip each; that is the intended trade (loud messages are rare, and
+        the ack state is the point of looking at them) rather than an oversight.
         """
         if msg is None or not requires_ack(msg.get("importance")):
             return msg
@@ -410,10 +521,32 @@ class RedisStore:
         # pub/sub is lossy while a subscriber is disconnected, so watchers must never
         # treat a ping as the content. They re-read the feed above their own cursor, which
         # makes a dropped ping cost latency (until the next poll tick) and never a message.
-        self.r.publish(self._k(p, "events"), msg_id)
+        #
+        # Swallowed on failure by the same logic: the message is already committed and
+        # readable, so raising here would report a successful post as failed, and the
+        # caller's retry would put a duplicate on the board. A lost ping costs one poll
+        # interval, which is precisely what the fallback poll is for.
+        try:
+            self.r.publish(self._k(p, "events"), msg_id)
+        except redis.RedisError:
+            pass
 
-        return {"message_id": msg_id, "thread_id": thread_id, "project": p,
-                "importance": msg["importance"], "requires_ack": requires_ack(msg["importance"])}
+        result = {"message_id": msg_id, "thread_id": thread_id, "project": p,
+                  "importance": msg["importance"],
+                  "requires_ack": requires_ack(msg["importance"])}
+        # Say so when the requested level was not the one used. Silently coercing teaches
+        # nothing: the poster asked for a delivery behaviour and got a different one, and
+        # this is the moment it can still be corrected.
+        requested = (importance or "").strip().lower()
+        if requested and requested != msg["importance"]:
+            result["importance_note"] = (
+                f"'{requested}' is not a delivery level, so this was posted as "
+                f"'{msg['importance']}'. The levels are: "
+                f"{', '.join(IMPORTANCE_LEVELS)} (quiet delivers to nobody until they "
+                f"check; normal notifies in one line; attention and halt inline the whole "
+                f"body and expect an ack)."
+            )
+        return result
 
     # ----------------------------------------------------------- check_mailbox
     def check_mailbox(self, project: str, agent: str, limit: int = 20,
@@ -452,6 +585,14 @@ class RedisStore:
 
         msgs, last_id, scanned = self._page_after(p, feed_key, watermark, lim)
         messages = [_summarize(m) for m in msgs]
+        # A message this agent already acked was almost certainly delivered to it as a live
+        # notification. The watermark deliberately did not move for that, so it shows up
+        # here as unread; flagging it lets a reader say "already seen" instead of reporting
+        # the same announcement to the human twice. Costs one SISMEMBER per loud message.
+        for summary in messages:
+            if summary["requires_ack"]:
+                summary["acked_by_me"] = bool(
+                    self.r.sismember(self._k(p, "ack", summary["id"]), agent))
 
         if mark_seen and (scanned or watermark > stored):
             # advance to the last id scanned this page; a backlog bigger than `lim` is

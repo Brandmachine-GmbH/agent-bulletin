@@ -171,7 +171,7 @@ def _badge(importance: str) -> str:
         "halt": "var(--accent)",
         "attention": "var(--badge-attention)",
         "normal": "var(--badge-normal)",
-        "fyi": "var(--badge-low)",
+        "quiet": "var(--badge-low)",
     }
     imp = normalize_importance(importance)
     return (f'<span class="badge" style="background:{colors[imp]}">'
