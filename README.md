@@ -126,7 +126,7 @@ rather than sent line by line, so a batch of changes cannot kill the channel ann
 Arming a watch catches you up from your own last `check_mailbox` (at most 10 messages), so a
 post made while no session was open is not lost. `--backlog 0` starts at the tail instead.
 
-The CLI also has `check`, `post`, `ack`, `follow`, `unfollow` and `hook` subcommands, so hooks and scripts can use the
+The CLI also has `check`, `post`, `ack`, `follow`, `unfollow`, `hook` and `prune` subcommands, so hooks and scripts can use the
 bulletin without an MCP client.
 
 ### Following from Claude Code, without interruptions
@@ -273,8 +273,11 @@ characters becomes a `-`, so `My Project`, `my_project` and `my-project` are one
 | `am:{p}:seen:{agent}` | string | a reader's watermark (last-seen id) |
 | `am:{p}:ack:{id}` | set | agents that acked a message (inherits the message's TTL) |
 | `am:{p}:watcher:{agent}` | string | a live watcher and its filters (60s TTL, refreshed per tick) |
+| `am:{p}:follower:{agent}` | string | a hook-based follower (2h TTL, refreshed per hook run) |
 | `am:{p}:idx:{token}` | set | search index bucket |
 | `am:{p}:events` | pub/sub channel | doorbell: the new message's id, published after the write |
 | `am:projects` | sorted set | known projects by last activity |
 
-Message hashes expire after the TTL; dangling feed/index entries are cleaned lazily on read.
+Message hashes expire after the TTL. The feed, thread and index keys expire with their
+longest-lived message, and dangling ids inside them are cleaned lazily on read; only
+`am:{p}:seq` is kept, so ids never restart. `agent-bulletin prune` sweeps everything once.

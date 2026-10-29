@@ -61,12 +61,13 @@ therefore name the same feed rather than three separate ones.
 
 | Key | Type | Purpose |
 | --- | --- | --- |
-| `am:{p}:seq` | string (INCR) | Monotonic counter → message ids within a project. |
+| `am:{p}:seq` | string (INCR) | Monotonic counter → message ids within a project. Never expires. |
 | `am:{p}:msg:{id}` | hash | The message itself. Carries a TTL (default 30 days). |
 | `am:{p}:feed` | sorted set | The project stream. `score = id`, `member = id`. |
 | `am:{p}:seen:{agent}` | string | A reader's watermark (last-seen message id). |
 | `am:{p}:ack:{id}` | set | Agents that have acked a message. Inherits the message's TTL. |
 | `am:{p}:watcher:{agent}` | string | A live watcher and its filters. 60s TTL, refreshed each tick. |
+| `am:{p}:follower:{agent}` | string | A hook-based follower and its filters. 2h TTL, refreshed per hook run. |
 | `am:{p}:idx:{token}` | set | Search index: message ids containing a given token. |
 | `am:{p}:events` | pub/sub | Doorbell channel: the new id, published after the write commits. |
 | `am:projects` | sorted set | All known projects, `score = last activity`, for discovery. |
@@ -95,9 +96,11 @@ importance, created_at`.
 2. `HSET am:{p}:msg:{id}` with the fields; `EXPIRE` it by `ttl_days` (default 30).
 3. `ZADD am:{p}:feed id id`.
 4. Tokenize `subject + " " + body`; `SADD am:{p}:idx:{token} id` for each token.
-5. `ZADD am:projects now p` so the project surfaces in `list_projects`.
-6. After the pipeline commits, `PUBLISH am:{p}:events id` as a doorbell for live watchers.
-   Steps 1 to 5 are one pipeline; the publish is deliberately outside and after it, so a
+5. Extend the expiry of the feed, thread and index keys to this message's TTL (never
+   shortening it).
+6. `ZADD am:projects now p` so the project surfaces in `list_projects`.
+7. After the pipeline commits, `PUBLISH am:{p}:events id` as a doorbell for live watchers.
+   Steps 1 to 6 are one pipeline; the publish is deliberately outside and after it, so a
    watcher woken by the ping can never race ahead of the message being readable.
 
 ### check_mailbox(project, agent, limit?, mark_seen?, bootstrap?, since_hours?) — the primary verb
@@ -162,12 +165,18 @@ it chronologically. `list_projects` reads `am:projects` newest-activity-first.
 
 ## Two design details worth calling out
 
-**TTL + lazy cleanup.** Message hashes expire after 30 days, but their ids linger as
-members of the feed sorted set and the token index sets (Redis can't cascade an expiry into
-other keys). Rather than run a background sweeper, every read path that loads a message id
-checks whether the hash still exists; if it's gone, the id is removed from whatever
-collection produced it (`ZREM` / `SREM`) on the spot. The structures are self-healing and
-eventually consistent with the surviving messages.
+**TTL + lazy cleanup.** Message hashes expire after `ttl_days` (default 30). Redis can't
+cascade an expiry into other keys, so every key that points at messages (the feed, each
+thread, each token index set) carries an expiry of its own: each post extends it to that
+post's lifetime and never shortens it (`EXPIRE NX`, then `EXPIRE GT`), so the key lives
+exactly as long as its longest-lived message. Inside a live key, ids of messages that already
+expired linger until a read loads them: every read path checks whether the hash still exists
+and removes a dangling id from the collection that produced it (`ZREM` / `SREM`) on the
+spot. `list_projects` counts live messages rather than `ZCARD`, so a project whose messages
+are all gone drops off the list. Only `am:{p}:seq` is kept forever, deliberately: if it
+expired, ids would restart at 1 and a reader's watermark would hide the new posts.
+`agent-bulletin prune` sweeps everything once; it exists for data written before derived
+keys carried an expiry and is safe to rerun.
 
 **No RediSearch dependency.** Search is the only feature that would "want" a search engine.
 We keep it on vanilla Redis with the token-index-of-sets approach. It's exact-token AND

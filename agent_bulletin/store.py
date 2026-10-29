@@ -5,7 +5,8 @@ The model is a per-project news feed (see architecture.md):
   - messages live in one ordered stream per project (a sorted set),
   - readers track "what's new" with a per-(project, agent) watermark,
   - search uses a tiny token inverted index built from plain Redis sets,
-  - messages auto-expire after a TTL; feed/index entries are cleaned lazily on read.
+  - messages auto-expire after a TTL; feed/thread/index keys carry the TTL of their
+    longest-lived message, and dangling entries inside them are cleaned lazily on read.
 
 No RediSearch / Redis Stack is required - this runs on vanilla Redis.
 """
@@ -159,6 +160,18 @@ def importance_at_least(value: Optional[str], minimum: Optional[str]) -> bool:
 def requires_ack(value: Optional[str]) -> bool:
     """True for levels where the sender is entitled to a read receipt."""
     return importance_at_least(value, ACK_FROM_IMPORTANCE)
+
+
+def _extend_ttl(pipe, key: str, ttl: int) -> None:
+    """Make `key` live at least `ttl` more seconds, never shortening it.
+
+    NX then GT, because neither alone does it: GT treats a key with no expiry as infinite
+    and so never sets one on a fresh key, while NX alone would let a 1-day message cut the
+    lifetime of a feed that also holds 30-day ones. The key then lives exactly as long as
+    its longest-lived member, which is what `ttl_days` being per message requires.
+    """
+    pipe.expire(key, ttl, nx=True)
+    pipe.expire(key, ttl, gt=True)
 
 
 def _iso(ts: float) -> str:
@@ -506,13 +519,22 @@ class RedisStore:
         # lexicographic member, which scrambles order and silently drops messages).
         score = int(msg_id)
 
+        feed_key, thread_key = self._k(p, "feed"), self._k(p, "thread", thread_id)
+        idx_keys = [self._k(p, "idx", t) for t in _tokenize(f"{subject} {body}")]
+
         pipe = self.r.pipeline()
         pipe.hset(msg_key, mapping=msg)
         pipe.expire(msg_key, ttl)
-        pipe.zadd(self._k(p, "feed"), {msg_id: score})
-        pipe.zadd(self._k(p, "thread", thread_id), {msg_id: score})
-        for token in _tokenize(f"{subject} {body}"):
-            pipe.sadd(self._k(p, "idx", token), msg_id)
+        pipe.zadd(feed_key, {msg_id: score})
+        pipe.zadd(thread_key, {msg_id: score})
+        for idx_key in idx_keys:
+            pipe.sadd(idx_key, msg_id)
+        # Every key that points at messages dies with the last message it points at. Lazy
+        # cleanup alone never removed a key nobody reads again: a quiet project's search
+        # index outlived its messages for good (63,904 orphaned idx keys by Oct 2026), and
+        # the front page kept listing projects whose every message was gone.
+        for key in (feed_key, thread_key, *idx_keys):
+            _extend_ttl(pipe, key, ttl)
         pipe.zadd(PROJECTS_KEY, {p: created_at})  # activity time, display/sort only
         pipe.execute()
 
@@ -697,13 +719,30 @@ class RedisStore:
         return {"project": p, "thread_id": str(thread_id), "count": len(msgs), "messages": msgs}
 
     # ----------------------------------------------------------- list_projects
+    def _drop_dangling(self, p: str, key: str, ids: list, kind: str = "zset") -> list:
+        """Remove ids whose message has expired from one collection; return the live ones."""
+        if not ids:
+            return []
+        pipe = self.r.pipeline()
+        for msg_id in ids:
+            pipe.exists(self._k(p, "msg", msg_id))
+        alive = pipe.execute()
+        dead = [i for i, ok in zip(ids, alive) if not ok]
+        if dead:
+            (self.r.zrem if kind == "zset" else self.r.srem)(key, *dead)
+        return [i for i, ok in zip(ids, alive) if ok]
+
     def list_projects(self, limit: int = 50) -> dict:
         items = self.r.zrevrange(PROJECTS_KEY, 0, _clamp_limit(limit) - 1, withscores=True)
         projects = []
         for slug, score in items:
-            feed_size = self.r.zcard(self._k(slug, "feed"))
+            # Counted from live messages, not ZCARD: expired ids stay in the feed until
+            # something loads them, so ZCARD kept showing "2 message(s)" on a project whose
+            # messages had all been gone for months. Feeds stay small, so checking each id
+            # here is cheap and leaves the feed clean for the next caller too.
+            feed_key = self._k(slug, "feed")
+            feed_size = len(self._drop_dangling(slug, feed_key, self.r.zrange(feed_key, 0, -1)))
             if feed_size == 0:
-                # no live feed entries left (everything expired); drop from the registry
                 self.r.zrem(PROJECTS_KEY, slug)
                 continue
             projects.append({
@@ -713,6 +752,69 @@ class RedisStore:
                 "message_count": feed_size,
             })
         return {"count": len(projects), "projects": projects}
+
+    # ------------------------------------------------------------------- prune
+    def prune(self, dry_run: bool = False) -> dict:
+        """Sweep every project once: drop expired ids, delete emptied keys, and give the
+        survivors the expiry `post` now sets.
+
+        Needed once for data written before derived keys carried a TTL; after that, expiry
+        keeps the store clean on its own and this only tidies dangling ids early. Safe to
+        run any time: it only removes ids whose message hash no longer exists, and only
+        deletes keys that are left empty by that.
+        """
+        counts = {"projects": 0, "keys_deleted": 0, "ids_removed": 0, "keys_ttl_set": 0,
+                  "registry_dropped": 0}
+        ttl_cache: dict = {}
+
+        def msg_ttl(p, msg_id):
+            if (p, msg_id) not in ttl_cache:
+                ttl_cache[(p, msg_id)] = self.r.ttl(self._k(p, "msg", msg_id))
+            return ttl_cache[(p, msg_id)]
+
+        slugs = set(self.r.zrange(PROJECTS_KEY, 0, -1))
+        for pattern in ("am:*:feed", "am:*:thread:*", "am:*:idx:*"):
+            for key in self.r.scan_iter(match=pattern, count=1000):
+                slugs.add(key.split(":")[1])
+
+        for p in sorted(slugs):
+            counts["projects"] += 1
+            keys = [self._k(p, "feed"),
+                    *self.r.scan_iter(match=self._k(p, "thread", "*"), count=1000),
+                    *self.r.scan_iter(match=self._k(p, "idx", "*"), count=1000)]
+            for key in keys:
+                is_set = ":idx:" in key
+                ids = list(self.r.smembers(key)) if is_set else self.r.zrange(key, 0, -1)
+                ttls = {i: msg_ttl(p, i) for i in ids}
+                live = [i for i, t in ttls.items() if t != -2]  # -2: the hash is gone
+                counts["ids_removed"] += len(ids) - len(live)
+                if dry_run:
+                    if not live:
+                        counts["keys_deleted"] += 1
+                    elif self.r.ttl(key) == -1:
+                        counts["keys_ttl_set"] += 1
+                    continue
+                if not live:
+                    counts["keys_deleted"] += self.r.delete(key)
+                    continue
+                dead = [i for i in ids if i not in set(live)]
+                if dead:
+                    (self.r.srem if is_set else self.r.zrem)(key, *dead)
+                # A message with no expiry (-1) would make the key's lifetime unbounded;
+                # fall back to the default rather than leaving the key persistent.
+                longest = max((t if t > 0 else DEFAULT_TTL_DAYS * 86400) for t in
+                              (ttls[i] for i in live))
+                if self.r.ttl(key) == -1:
+                    counts["keys_ttl_set"] += 1
+                pipe = self.r.pipeline()
+                _extend_ttl(pipe, key, longest)
+                pipe.execute()
+            if not self.r.exists(self._k(p, "feed")):
+                if dry_run:
+                    counts["registry_dropped"] += int(self.r.zscore(PROJECTS_KEY, p) is not None)
+                else:
+                    counts["registry_dropped"] += self.r.zrem(PROJECTS_KEY, p)
+        return counts
 
     # ------------------------------------------------------------------- admin
     def flush_project(self, project: str) -> int:

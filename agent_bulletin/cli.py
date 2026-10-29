@@ -305,6 +305,12 @@ def cmd_hook(args) -> int:
     return follow.hook_main()
 
 
+def cmd_prune(args) -> int:
+    counts = RedisStore().prune(dry_run=args.dry_run)
+    print(json.dumps({"dry_run": args.dry_run, **counts}, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-bulletin", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -352,6 +358,11 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("hook", help="Claude Code hook entry point (reads the hook JSON on "
                                     "stdin); wire it to PostToolBatch, UserPromptSubmit, Stop")
     h.set_defaults(func=cmd_hook)
+
+    pr = sub.add_parser("prune", help="remove leftovers of expired messages from every project "
+                                      "(safe to rerun)")
+    pr.add_argument("--dry-run", action="store_true", help="count, change nothing")
+    pr.set_defaults(func=cmd_prune)
 
     c = sub.add_parser("check", help="read this agent's unseen messages (advances the watermark)")
     c.add_argument("--project")
